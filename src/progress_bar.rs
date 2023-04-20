@@ -1,5 +1,5 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicI32, AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use fltk::enums::{Align, Color, Font, FrameType};
@@ -14,7 +14,7 @@ pub struct ProgressBar {
     max: Arc<AtomicUsize>,
     value: Arc<AtomicUsize>,
     max_size: Arc<AtomicI32>,
-    is_zero: Arc<AtomicBool>
+    is_zero: Arc<AtomicBool>,
 }
 
 impl ProgressBar {
@@ -22,12 +22,8 @@ impl ProgressBar {
         let progress_bar_bytes = include_bytes!("../res/Launcher_Alpha_LoadingBar.png");
         let font_bytes = include_bytes!("../res/JosefinSans-Bold.ttf");
         let black_bytes = include_bytes!("../res/ariblk.ttf");
-        Font::set_font(Font::Helvetica, unsafe {
-            std::mem::transmute::<&[u8], &str>(font_bytes)
-        });
-        Font::set_font(Font::Courier, unsafe {
-            std::mem::transmute::<&[u8], &str>(black_bytes)
-        });
+        Font::set_font(Font::Helvetica, std::str::from_utf8(font_bytes).unwrap());
+        Font::set_font(Font::Courier, std::str::from_utf8(black_bytes).unwrap());
         let mut bar = Frame::new(x, y, 546, 56 + 30, "");
         let min = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));
@@ -56,11 +52,7 @@ impl ProgressBar {
                     (value * png.width() as usize) / (max - min)
                 };
 
-                let width = if is_zero {
-                    png.width() as usize
-                } else {
-                    width
-                };
+                let width = if is_zero { png.width() as usize } else { width };
 
                 png.draw(b.x(), b.y(), width as i32, png.height());
 
@@ -72,11 +64,7 @@ impl ProgressBar {
                 } else {
                     (value * 100) / (max - min)
                 };
-                let percentage = if is_zero {
-                    100
-                } else {
-                    percentage
-                };
+                let percentage = if is_zero { 100 } else { percentage };
                 let percentage = format!("{}%", percentage);
                 let size = draw::width(&percentage);
                 if size + 20.0 <= width as f64 || is_zero {
@@ -144,7 +132,7 @@ impl ProgressBar {
             max,
             value,
             max_size,
-            is_zero
+            is_zero,
         }
     }
 
