@@ -22,8 +22,10 @@ impl ProgressBar {
         let progress_bar_bytes = include_bytes!("../res/Launcher_Alpha_LoadingBar.png");
         let font_bytes = include_bytes!("../res/JosefinSans-Bold.ttf");
         let black_bytes = include_bytes!("../res/ariblk.ttf");
-        Font::set_font(Font::Helvetica, std::str::from_utf8(font_bytes).unwrap());
-        Font::set_font(Font::Courier, std::str::from_utf8(black_bytes).unwrap());
+        unsafe {
+            Font::set_font(Font::Helvetica, std::str::from_utf8_unchecked(font_bytes));
+            Font::set_font(Font::Courier, std::str::from_utf8_unchecked(black_bytes));
+        }
         let mut bar = Frame::new(x, y, 546, 56 + 30, "");
         let min = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));

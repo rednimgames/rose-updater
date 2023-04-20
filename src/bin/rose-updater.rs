@@ -42,6 +42,10 @@ struct Args {
     #[clap(long, default_value = "manifest.json")]
     manifest_name: String,
 
+    /// Skip checking for updater update and only update data files
+    #[clap(long)]
+    skip_updater: bool,
+
     /// Ignore the local manifest in the cache and force all files to be checked
     #[clap(long)]
     force_recheck: bool,
@@ -300,7 +304,7 @@ async fn process(
     let updater_output_path = args.output.join(&remote_manifest.updater.source_path);
     let updater_needs_update = remote_manifest.updater.source_hash != local_manifest.updater.hash;
 
-    if args.force_recheck_updater || updater_needs_update {
+    if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
         main_updater
