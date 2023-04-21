@@ -33,7 +33,7 @@ impl LaunchButton {
                     LaunchButtonState::Updating => updating_state,
                     LaunchButtonState::Play => play_state,
                 };
-                let mut png = PngImage::from_data(&image_data).unwrap();
+                let mut png = PngImage::from_data(image_data).unwrap();
                 png.draw(f.x(), f.y(), png.width(), png.height());
             }
         });

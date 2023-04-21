@@ -100,10 +100,10 @@ async fn main() -> anyhow::Result<()> {
 
         let output_relative_path = &args
             .archive_prefix_dir
-            .join(&input_relative_path)
+            .join(input_relative_path)
             .with_extension(format!("{}.{}", &input_extension, &args.archive_extension));
 
-        let output_path = (&args.output).join(&output_relative_path);
+        let output_path = args.output.join(output_relative_path);
 
         println!("{} => {}", input_path.display(), output_path.display());
 

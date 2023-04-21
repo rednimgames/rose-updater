@@ -3,9 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use clap::Parser;
 use fltk::frame::Frame;
@@ -20,7 +19,10 @@ use tracing_subscriber::FmtSubscriber;
 #[cfg(feature = "console")]
 use console_subscriber;
 
-use rose_update::{clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry, RemoteManifest, Updater, RemoteManifestFileEntry};
+use rose_update::{
+    clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry,
+    RemoteManifest, RemoteManifestFileEntry, Updater,
+};
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
 const UPDATER_OLD_EXT: &str = "old";
@@ -39,6 +41,10 @@ struct Args {
     /// Name of manifest file
     #[clap(long, default_value = "manifest.json")]
     manifest_name: String,
+
+    /// Skip checking for updater update and only update data files
+    #[clap(long)]
+    skip_updater: bool,
 
     /// Ignore the local manifest in the cache and force all files to be checked
     #[clap(long)]
@@ -79,7 +85,7 @@ async fn save_local_manifest(manifest_path: &Path, manfiest: &LocalManifest) -> 
         std::fs::create_dir_all(manifest_parent_dir)?;
     }
 
-    let manifest_file = std::fs::File::create(&manifest_path)?;
+    let manifest_file = std::fs::File::create(manifest_path)?;
     serde_json::to_writer(manifest_file, &manfiest)?;
 
     info!("Saved local manifest to {}", manifest_path.display());
@@ -89,19 +95,28 @@ async fn save_local_manifest(manifest_path: &Path, manfiest: &LocalManifest) -> 
 
 enum DownloadResult {
     ApplicationUpdated,
-    UpdaterUpdated
+    UpdaterUpdated,
 }
 
-async fn get_remote_manifest(remote_url: &Url, manifest_name: &str) -> anyhow::Result<RemoteManifest> {
+async fn get_remote_manifest(
+    remote_url: &Url,
+    manifest_name: &str,
+) -> anyhow::Result<RemoteManifest> {
     info!("Downloading remote manifest");
     // Download our remote manifest file
     let remote_manifest_url = remote_url.join(manifest_name)?;
     Ok(reqwest::get(remote_manifest_url)
         .await?
-        .json::<RemoteManifest>().await?)
+        .json::<RemoteManifest>()
+        .await?)
 }
 
-async fn update_updater(local_updater_path: &PathBuf, updater_output_path: &PathBuf, remote_url: &Url, main_updater: MainProgressUpdater) -> anyhow::Result<()> {
+async fn update_updater(
+    local_updater_path: &Path,
+    updater_output_path: &Path,
+    remote_url: &Url,
+    main_updater: MainProgressUpdater,
+) -> anyhow::Result<()> {
     // When the updater needs to be updated we change the exe name before
     // restarting the process. This step ensures that we delete the old,
     // outdated updater exe.
@@ -130,18 +145,15 @@ async fn update_updater(local_updater_path: &PathBuf, updater_output_path: &Path
             ))?;
     }
 
-    clone_remote(
-        &remote_url,
-        &updater_output_path,
-        main_updater,
-    )
+    clone_remote(remote_url, updater_output_path, main_updater)
         .await
-        .context(format!(
-            "Failed to clone {}",
-            &remote_url
-        ))?;
+        .context(format!("Failed to clone {}", &remote_url))?;
 
-    info!("Cloned {} to {}", &remote_url, updater_output_path.display());
+    info!(
+        "Cloned {} to {}",
+        &remote_url,
+        updater_output_path.display()
+    );
 
     Ok(())
 }
@@ -151,20 +163,20 @@ async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
 
     // Read the manifest file if we can. Otherwise we default to an empty local
     // manifest which we save as a new manifest later.
-    let local_manifest = if folder.try_exists().context("Failed to get the local manifest")? {
-            info!(
-                "Using existing manifest file: {}",
-                folder.display()
-            );
+    let local_manifest = if folder
+        .try_exists()
+        .context("Failed to get the local manifest")?
+    {
+        info!("Using existing manifest file: {}", folder.display());
 
-            let file = File::open(&folder).await?;
-            match serde_json::from_reader(file.into_std().await) {
-                Ok(manifest) => manifest,
-                Err(_) => {
-                    info!("Failed to parse local manifest");
-                    LocalManifest::default()
-                }
+        let file = File::open(&folder).await?;
+        match serde_json::from_reader(file.into_std().await) {
+            Ok(manifest) => manifest,
+            Err(_) => {
+                info!("Failed to parse local manifest");
+                LocalManifest::default()
             }
+        }
     } else {
         LocalManifest::default()
     };
@@ -172,7 +184,13 @@ async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
     Ok(local_manifest)
 }
 
-fn verify_local_files(output: &PathBuf, remote_url: &Url, remote_manifest: RemoteManifest, local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>, force_verify: bool) -> anyhow::Result<(Vec<(Url, RemoteManifestFileEntry)>, usize, usize)> {
+fn verify_local_files(
+    output: &Path,
+    remote_url: &Url,
+    remote_manifest: RemoteManifest,
+    local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>,
+    force_verify: bool,
+) -> anyhow::Result<(Vec<(Url, RemoteManifestFileEntry)>, usize, usize)> {
     info!("Checking local files");
 
     let mut files_to_update = Vec::new();
@@ -198,7 +216,10 @@ fn verify_local_files(output: &PathBuf, remote_url: &Url, remote_manifest: Remot
         total_size += remote_entry.source_size;
 
         if !force_verify && !needs_update() {
-            debug!("Skipping file {} as it is already present", output_path.display());
+            debug!(
+                "Skipping file {} as it is already present",
+                output_path.display()
+            );
             already_downloaded_size += remote_entry.source_size;
             continue;
         }
@@ -210,9 +231,13 @@ fn verify_local_files(output: &PathBuf, remote_url: &Url, remote_manifest: Remot
     Ok((files_to_update, total_size, already_downloaded_size))
 }
 
-fn get_remote_files(output: &PathBuf, files_to_update: Vec<(Url, RemoteManifestFileEntry)>, main_updater: MainProgressUpdater, shutdown_rx: tokio::sync::watch::Receiver<bool>, tx: tokio::sync::mpsc::Sender<LocalManifestFileEntry>)
-    -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
-
+fn get_remote_files(
+    output: &Path,
+    files_to_update: Vec<(Url, RemoteManifestFileEntry)>,
+    main_updater: MainProgressUpdater,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    tx: tokio::sync::mpsc::Sender<LocalManifestFileEntry>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut clone_tasks = Vec::new();
 
     for entry in files_to_update {
@@ -248,10 +273,11 @@ fn get_remote_files(output: &PathBuf, files_to_update: Vec<(Url, RemoteManifestF
     Ok(clone_tasks)
 }
 
-async fn process(args: &Args,
-                 main_updater: MainProgressUpdater,
-                 mut shutdown_rx: tokio::sync::watch::Receiver<bool>) -> anyhow::Result<DownloadResult> {
-
+async fn process(
+    args: &Args,
+    main_updater: MainProgressUpdater,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<DownloadResult> {
     let remote_url =
         Url::parse(&args.url).context(format!("Failed to parse the url {}", args.url))?;
 
@@ -264,7 +290,7 @@ async fn process(args: &Args,
     let local_manifest_path = args
         .output
         .join("updater")
-        .join(&remote_url.host_str().unwrap_or("default"))
+        .join(remote_url.host_str().unwrap_or("default"))
         .join("local_manifest.json");
 
     let local_manifest = tokio::select! {
@@ -278,10 +304,12 @@ async fn process(args: &Args,
     let updater_output_path = args.output.join(&remote_manifest.updater.source_path);
     let updater_needs_update = remote_manifest.updater.source_hash != local_manifest.updater.hash;
 
-    if args.force_recheck_updater || updater_needs_update {
+    if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
-        main_updater.set_max_progress(remote_manifest.updater.source_size).await;
+        main_updater
+            .set_max_progress(remote_manifest.updater.source_size)
+            .await;
 
         let remote = remote_url.join(&remote_manifest.updater.path)?;
 
@@ -323,10 +351,18 @@ async fn process(args: &Args,
         current_local_filedata.insert(PathBuf::from(&entry.path), entry.clone());
     }
 
-    let (files_to_download, total_size, already_downloaded_size) = verify_local_files(&args.output, &remote_url, remote_manifest, &current_local_filedata, args.verify)?;
+    let (files_to_download, total_size, already_downloaded_size) = verify_local_files(
+        &args.output,
+        &remote_url,
+        remote_manifest,
+        &current_local_filedata,
+        args.verify,
+    )?;
 
     main_updater.set_max_progress(total_size).await;
-    main_updater.increment_progress(already_downloaded_size).await;
+    main_updater
+        .increment_progress(already_downloaded_size)
+        .await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LocalManifestFileEntry>(64);
 
@@ -346,8 +382,14 @@ async fn process(args: &Args,
         (hash_new_local_manifest, new_local_manifest)
     });
 
-    let clone_tasks = get_remote_files(&args.output, files_to_download, main_updater, shutdown_rx, tx)?;
-    
+    let clone_tasks = get_remote_files(
+        &args.output,
+        files_to_download,
+        main_updater,
+        shutdown_rx,
+        tx,
+    )?;
+
     futures::future::join_all(clone_tasks).await;
     let (hash_new_local_manifest, mut new_local_manifest) = work.await?;
 
@@ -373,26 +415,26 @@ enum Message {
     MainProgressUpdate(MainProgressUpdaterEvent),
     Launch,
     Shutdown,
-    Error
+    Error,
 }
 
 #[derive(Clone)]
 struct MainProgressUpdater {
-    sender: app::Sender::<Message>,
+    sender: app::Sender<Message>,
 }
 
 #[async_trait]
 impl Updater for MainProgressUpdater {
     async fn set_max_progress(&self, total: usize) {
-        self
-            .sender
-            .send(Message::MainProgressUpdate(MainProgressUpdaterEvent::SetMaxProgress(total)));
+        self.sender.send(Message::MainProgressUpdate(
+            MainProgressUpdaterEvent::SetMaxProgress(total),
+        ));
     }
 
     async fn increment_progress(&self, amount: usize) {
-        self
-            .sender
-            .send(Message::MainProgressUpdate(MainProgressUpdaterEvent::IncrementProgress(amount)));
+        self.sender.send(Message::MainProgressUpdate(
+            MainProgressUpdaterEvent::IncrementProgress(amount),
+        ));
     }
 }
 
@@ -482,9 +524,7 @@ fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Create our updaters
-    let main_updater = MainProgressUpdater {
-        sender: tx.clone(),
-    };
+    let main_updater = MainProgressUpdater { sender: tx.clone() };
 
     // Clone some args before moving args into download task
     let exe = args.exe.clone();
@@ -493,21 +533,21 @@ fn main() -> anyhow::Result<()> {
 
     // When the launch button is clicked we start the application
     launch_button.set_callback(move |_| {
-            info!(
-                "Executing Command: {}/{} {}",
-                exe_dir.display(),
-                exe.display(),
-                exe_args.join(" ")
-            );
+        info!(
+            "Executing Command: {}/{} {}",
+            exe_dir.display(),
+            exe.display(),
+            exe_args.join(" ")
+        );
 
-            Command::new(&exe)
-                .current_dir(&exe_dir)
-                .args(&exe_args)
-                .spawn()
-                .unwrap();
-            
-            app.clone().quit();
-        });
+        Command::new(&exe)
+            .current_dir(&exe_dir)
+            .args(&exe_args)
+            .spawn()
+            .unwrap();
+
+        app.quit();
+    });
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -531,7 +571,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         } else {
-            error!("Download task failed or cancelled, error {}", result.err().unwrap());
+            error!(
+                "Download task failed or cancelled, error {}",
+                result.err().unwrap()
+            );
             tx.send(Message::Error);
         }
     });
@@ -539,20 +582,18 @@ fn main() -> anyhow::Result<()> {
     while app.wait() {
         if let Some(e) = rx.recv() {
             match e {
-                Message::MainProgressUpdate(e) => {
-                    match e {
-                        MainProgressUpdaterEvent::SetMaxProgress(amount) => {
-                            main_progress_bar.set_minimum(0);
-                            main_progress_bar.set_maximum(amount);
-                            main_progress_bar.set_value(0);
-                            background_frame.redraw();
-                            main_progress_bar.redraw();
-                            launch_button.redraw();
-                        }
-                        MainProgressUpdaterEvent::IncrementProgress(amount) => {
-                            main_progress_bar.set_value(main_progress_bar.value() + amount);
-                            main_progress_bar.redraw();
-                        }
+                Message::MainProgressUpdate(e) => match e {
+                    MainProgressUpdaterEvent::SetMaxProgress(amount) => {
+                        main_progress_bar.set_minimum(0);
+                        main_progress_bar.set_maximum(amount);
+                        main_progress_bar.set_value(0);
+                        background_frame.redraw();
+                        main_progress_bar.redraw();
+                        launch_button.redraw();
+                    }
+                    MainProgressUpdaterEvent::IncrementProgress(amount) => {
+                        main_progress_bar.set_value(main_progress_bar.value() + amount);
+                        main_progress_bar.redraw();
                     }
                 },
                 Message::Launch => {
@@ -560,13 +601,17 @@ fn main() -> anyhow::Result<()> {
                     launch_button.activate();
                     launch_button.change_state(launch_button::LaunchButtonState::Play);
                     launch_button.redraw();
-                },
+                }
                 Message::Shutdown => {
                     info!("Shutting down");
                     break;
-                },
+                }
                 Message::Error => {
-                    dialog::alert((app::screen_size().0 / 2.0) as i32, (app::screen_size().0 / 2.0) as i32,"An error was detected, please restart the launcher");
+                    dialog::alert(
+                        (app::screen_size().0 / 2.0) as i32,
+                        (app::screen_size().0 / 2.0) as i32,
+                        "An error was detected, please restart the launcher",
+                    );
                     break;
                 }
             }
@@ -584,6 +629,6 @@ fn main() -> anyhow::Result<()> {
     if result.is_err() {
         error!("Error while closing down download process");
     }
-    
+
     Ok(())
 }
