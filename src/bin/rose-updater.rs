@@ -415,7 +415,7 @@ enum Message {
     MainProgressUpdate(MainProgressUpdaterEvent),
     Launch,
     Shutdown,
-    Error,
+    Error(String),
 }
 
 #[derive(Clone)]
@@ -571,11 +571,12 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         } else {
+            let error_string = result.err().unwrap().to_string();
             error!(
                 "Download task failed or cancelled, error {}",
-                result.err().unwrap()
+                &error_string
             );
-            tx.send(Message::Error);
+            tx.send(Message::Error(error_string));
         }
     });
 
@@ -606,11 +607,11 @@ fn main() -> anyhow::Result<()> {
                     info!("Shutting down");
                     break;
                 }
-                Message::Error => {
+                Message::Error(e) => {
                     dialog::alert(
                         (app::screen_size().0 / 2.0) as i32,
                         (app::screen_size().0 / 2.0) as i32,
-                        "An error was detected, please restart the launcher",
+                        &format!("An error was detected, please restart the launcher:\nError: {}", e),
                     );
                     break;
                 }
