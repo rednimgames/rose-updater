@@ -27,6 +27,8 @@ use rose_update::{
 const LOCAL_MANIFEST_VERSION: usize = 1;
 const UPDATER_OLD_EXT: &str = "old";
 
+const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
+
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
@@ -246,6 +248,21 @@ fn get_remote_files(
         let output_path = output.join(&remote_entry.source_path);
         let mut cloned_shutdown = shutdown_rx.clone();
         let cloned_tx = tx.clone();
+
+        // Bitar doesn't handle text files well so when one of the text files
+        // has changed, we delete it first so bitar will just redownload the
+        // whole file.
+        if let Some(ext) = output_path.extension().and_then(|s| s.to_str()) {
+            if TEXT_FILE_EXTENSIONS.contains(&ext) {
+                if let Err(e) = std::fs::remove_file(&output_path) {
+                    error!(
+                        path =? output_path.display(),
+                        error =? e,
+                        "Failed to delete text file"
+                    )
+                }
+            }
+        }
 
         clone_tasks.push(tokio::spawn(async move {
             info!("Downloading {}", &clone_url);
@@ -572,10 +589,7 @@ fn main() -> anyhow::Result<()> {
             }
         } else {
             let error_string = result.err().unwrap().to_string();
-            error!(
-                "Download task failed or cancelled, error {}",
-                &error_string
-            );
+            error!("Download task failed or cancelled, error {}", &error_string);
             tx.send(Message::Error(error_string));
         }
     });
@@ -611,7 +625,10 @@ fn main() -> anyhow::Result<()> {
                     dialog::alert(
                         (app::screen_size().0 / 2.0) as i32,
                         (app::screen_size().0 / 2.0) as i32,
-                        &format!("An error was detected, please restart the launcher:\nError: {}", e),
+                        &format!(
+                            "An error was detected, please restart the launcher:\nError: {}",
+                            e
+                        ),
                     );
                     break;
                 }
