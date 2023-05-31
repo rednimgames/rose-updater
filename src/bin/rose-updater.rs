@@ -186,13 +186,19 @@ async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
     Ok(local_manifest)
 }
 
+struct VerificationResults {
+    files_to_update: Vec<(reqwest::Url, RemoteManifestFileEntry)>,
+    total_size: usize,
+    already_downloaded_size: usize,
+}
+
 fn verify_local_files(
     output: &Path,
     remote_url: &Url,
     remote_manifest: RemoteManifest,
     local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>,
     force_verify: bool,
-) -> anyhow::Result<(Vec<(Url, RemoteManifestFileEntry)>, usize, usize)> {
+) -> anyhow::Result<VerificationResults> {
     info!("Checking local files");
 
     let mut files_to_update = Vec::new();
@@ -230,7 +236,11 @@ fn verify_local_files(
         files_to_update.push((clone_url, remote_entry));
     }
 
-    Ok((files_to_update, total_size, already_downloaded_size))
+    Ok(VerificationResults {
+        files_to_update,
+        total_size,
+        already_downloaded_size,
+    })
 }
 
 fn get_remote_files(
@@ -368,7 +378,11 @@ async fn process(
         current_local_filedata.insert(PathBuf::from(&entry.path), entry.clone());
     }
 
-    let (files_to_download, total_size, already_downloaded_size) = verify_local_files(
+    let VerificationResults {
+        files_to_update,
+        total_size,
+        already_downloaded_size,
+    } = verify_local_files(
         &args.output,
         &remote_url,
         remote_manifest,
@@ -399,13 +413,8 @@ async fn process(
         (hash_new_local_manifest, new_local_manifest)
     });
 
-    let clone_tasks = get_remote_files(
-        &args.output,
-        files_to_download,
-        main_updater,
-        shutdown_rx,
-        tx,
-    )?;
+    let clone_tasks =
+        get_remote_files(&args.output, files_to_update, main_updater, shutdown_rx, tx)?;
 
     futures::future::join_all(clone_tasks).await;
     let (hash_new_local_manifest, mut new_local_manifest) = work.await?;

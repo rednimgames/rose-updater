@@ -13,7 +13,7 @@ pub struct ProgressBar {
     min: Arc<AtomicUsize>,
     max: Arc<AtomicUsize>,
     value: Arc<AtomicUsize>,
-    max_size: Arc<AtomicI32>,
+    _max_size: Arc<AtomicI32>,
     is_zero: Arc<AtomicBool>,
 }
 
@@ -133,7 +133,7 @@ impl ProgressBar {
             min,
             max,
             value,
-            max_size,
+            _max_size: max_size,
             is_zero,
         }
     }
