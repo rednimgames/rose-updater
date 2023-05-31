@@ -65,7 +65,7 @@ struct Args {
     verify: bool,
 
     /// Executable to run after updating
-    #[clap(default_value = "trose.exe")]
+    #[clap(long, default_value = "trose.exe")]
     exe: PathBuf,
 
     /// Arguments for the executable
