@@ -27,6 +27,8 @@ use rose_update::{
 const LOCAL_MANIFEST_VERSION: usize = 1;
 const UPDATER_OLD_EXT: &str = "old";
 
+const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
+
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
@@ -63,7 +65,7 @@ struct Args {
     verify: bool,
 
     /// Executable to run after updating
-    #[clap(default_value = "trose.exe")]
+    #[clap(long, default_value = "trose.exe")]
     exe: PathBuf,
 
     /// Arguments for the executable
@@ -184,13 +186,19 @@ async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
     Ok(local_manifest)
 }
 
+struct VerificationResults {
+    files_to_update: Vec<(reqwest::Url, RemoteManifestFileEntry)>,
+    total_size: usize,
+    already_downloaded_size: usize,
+}
+
 fn verify_local_files(
     output: &Path,
     remote_url: &Url,
     remote_manifest: RemoteManifest,
     local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>,
     force_verify: bool,
-) -> anyhow::Result<(Vec<(Url, RemoteManifestFileEntry)>, usize, usize)> {
+) -> anyhow::Result<VerificationResults> {
     info!("Checking local files");
 
     let mut files_to_update = Vec::new();
@@ -228,7 +236,11 @@ fn verify_local_files(
         files_to_update.push((clone_url, remote_entry));
     }
 
-    Ok((files_to_update, total_size, already_downloaded_size))
+    Ok(VerificationResults {
+        files_to_update,
+        total_size,
+        already_downloaded_size,
+    })
 }
 
 fn get_remote_files(
@@ -246,6 +258,21 @@ fn get_remote_files(
         let output_path = output.join(&remote_entry.source_path);
         let mut cloned_shutdown = shutdown_rx.clone();
         let cloned_tx = tx.clone();
+
+        // Bitar doesn't handle text files well so when one of the text files
+        // has changed, we delete it first so bitar will just redownload the
+        // whole file.
+        if let Some(ext) = output_path.extension().and_then(|s| s.to_str()) {
+            if TEXT_FILE_EXTENSIONS.contains(&ext) {
+                if let Err(e) = std::fs::remove_file(&output_path) {
+                    error!(
+                        path =? output_path.display(),
+                        error =? e,
+                        "Failed to delete text file"
+                    )
+                }
+            }
+        }
 
         clone_tasks.push(tokio::spawn(async move {
             info!("Downloading {}", &clone_url);
@@ -351,7 +378,11 @@ async fn process(
         current_local_filedata.insert(PathBuf::from(&entry.path), entry.clone());
     }
 
-    let (files_to_download, total_size, already_downloaded_size) = verify_local_files(
+    let VerificationResults {
+        files_to_update,
+        total_size,
+        already_downloaded_size,
+    } = verify_local_files(
         &args.output,
         &remote_url,
         remote_manifest,
@@ -382,13 +413,8 @@ async fn process(
         (hash_new_local_manifest, new_local_manifest)
     });
 
-    let clone_tasks = get_remote_files(
-        &args.output,
-        files_to_download,
-        main_updater,
-        shutdown_rx,
-        tx,
-    )?;
+    let clone_tasks =
+        get_remote_files(&args.output, files_to_update, main_updater, shutdown_rx, tx)?;
 
     futures::future::join_all(clone_tasks).await;
     let (hash_new_local_manifest, mut new_local_manifest) = work.await?;
@@ -572,10 +598,7 @@ fn main() -> anyhow::Result<()> {
             }
         } else {
             let error_string = result.err().unwrap().to_string();
-            error!(
-                "Download task failed or cancelled, error {}",
-                &error_string
-            );
+            error!("Download task failed or cancelled, error {}", &error_string);
             tx.send(Message::Error(error_string));
         }
     });
@@ -611,7 +634,10 @@ fn main() -> anyhow::Result<()> {
                     dialog::alert(
                         (app::screen_size().0 / 2.0) as i32,
                         (app::screen_size().0 / 2.0) as i32,
-                        &format!("An error was detected, please restart the launcher:\nError: {}", e),
+                        &format!(
+                            "An error was detected, please restart the launcher:\nError: {}",
+                            e
+                        ),
                     );
                     break;
                 }
