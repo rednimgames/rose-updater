@@ -1,7 +1,7 @@
 pub mod bitar_ext;
-pub mod launch_button;
 pub mod manifest;
-pub mod progress_bar;
+pub mod style;
+pub mod widgets;
 
 pub use bitar_ext::*;
 pub use manifest::*;
