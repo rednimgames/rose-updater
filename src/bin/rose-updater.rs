@@ -505,6 +505,8 @@ impl eframe::App for UpdaterApp {
                 frame.close();
             }
         }
+
+        ctx.request_repaint();
     }
 }
 
@@ -864,16 +866,11 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
         tracing::info!("Updating updater");
         set_progress_text("Updating updater");
 
-        let updater_url = remote_url.join(&remote_manifest.updater.path)?;
-        let mut downloader = RemoteFileDownloader::new(&updater_url, &updater_output_path).await?;
-
-        let total_local_chunks_size = downloader.output_original_size();
-        let total_download_chunk_count = downloader.chunk_download_count();
-
         // We cannot delete or modify a currently executing binary so we rename
         // the currently executing updater to allow us to download the new one
         // with the same name.
-        if updater_output_path_old.exists() {
+        tracing::info!("{}", updater_output_path.display());
+        if updater_output_path.exists() {
             fs::rename(&updater_output_path, &updater_output_path_old)
                 .await
                 .context(format!(
@@ -882,6 +879,12 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
                     updater_output_path_old.display(),
                 ))?;
         }
+
+        let updater_url = remote_url.join(&remote_manifest.updater.path)?;
+        let mut downloader = RemoteFileDownloader::new(&updater_url, &updater_output_path).await?;
+
+        let total_local_chunks_size = downloader.output_original_size();
+        let total_download_chunk_count = downloader.chunk_download_count();
 
         // Verify local updater chunks. If there is no existing file then there
         // will be no verification step.
@@ -949,7 +952,7 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
             // All arguments passed to the original updater are forwarded to
             // the new one except ones that would cause issues (e.g.
             // force-recheck triggering an infinite loop).
-            Command::new(env::current_exe()?)
+            Command::new(&updater_output_path)
                 .args(
                     env::args()
                         .skip(1)
@@ -1161,6 +1164,7 @@ fn main() -> anyhow::Result<()> {
         icon_data: Some(eframe::IconData::try_from_png_bytes(ICON_BYTES)?),
         resizable: false,
         decorated: false,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
