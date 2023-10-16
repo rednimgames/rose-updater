@@ -53,8 +53,6 @@ const LOCAL_MANIFEST_VERSION: usize = 1;
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 const UPDATER_OLD_EXT: &str = "old";
 
-const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
-
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
