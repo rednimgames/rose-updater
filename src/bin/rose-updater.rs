@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env,
     fs::File,
+    io::{BufReader, BufWriter},
     path::{Path, PathBuf},
     pin::pin,
     process::Command,
@@ -18,8 +19,7 @@ use futures_util::{future::try_join_all, StreamExt};
 use reqwest::Url;
 use serde::Deserialize;
 use tokio::{fs, runtime::Runtime};
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{filter::LevelFilter, EnvFilter, FmtSubscriber};
 
 use rose_update::{
     style::{FONT_POPPINS_BOLD, FONT_POPPINS_LIGHT, FONT_POPPINS_MEDIUM, FONT_POPPINS_REGULAR},
@@ -57,7 +57,7 @@ const UPDATER_OLD_EXT: &str = "old";
 #[clap(about, version, author)]
 struct Args {
     /// Remote archive URL
-    #[clap(long, default_value = "https://updates.roseonlinegame.com")]
+    #[clap(long, default_value = "https://updates2.roseonlinegame.com")]
     url: String,
 
     #[clap(long, default_value = "https://www.roseonlinegame.com/api/v1/news")]
@@ -557,15 +557,6 @@ fn draw_title_bar(ui: &mut egui::Ui, app_frame: &mut eframe::Frame) -> Option<Ti
         egui::Sense::click(),
     );
 
-    // let painter = ui.painter();
-    // painter.line_segment(
-    //     [
-    //         title_bar_rect.left_bottom() + egui::vec2(1.0, 0.0),
-    //         title_bar_rect.right_bottom() + egui::vec2(-1.0, 0.0),
-    //     ],
-    //     egui::Stroke::new(0.5, egui::Color32::from_black_alpha(50)),
-    // );
-
     if title_bar_response.double_clicked() {
         app_frame.set_maximized(!app_frame.info().window_info.maximized);
     } else if title_bar_response.is_pointer_button_down_on() {
@@ -840,7 +831,7 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
     set_progress_text("Loading local patch data");
 
     let local_manifest = if let Ok(file) = File::open(&local_manifest_path) {
-        match serde_json::from_reader(file) {
+        match serde_json::from_reader(BufReader::new(file)) {
             Ok(manifest) => manifest,
             Err(_) => LocalManifest::default(),
         }
@@ -881,7 +872,12 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
         }
 
         let updater_url = remote_url.join(&remote_manifest.updater.path)?;
-        let mut downloader = RemoteFileDownloader::new(&updater_url, &updater_output_path).await?;
+        let mut downloader = RemoteFileDownloader::new(
+            &updater_url,
+            &updater_output_path,
+            reqwest::Client::builder().build()?,
+        )
+        .await?;
 
         let total_local_chunks_size = downloader.output_original_size();
         let total_download_chunk_count = downloader.chunk_download_count();
@@ -966,77 +962,126 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
         set_progress_text("Updater up-to-date");
     }
 
-    set_progress_text("Checking files for updates");
+    // Check which files need to be updated by comparing data in the local
+    // manifest to the remote manifest.
+    let files_to_update = {
+        tracing::debug!("Checking file to update");
 
-    // Create a lookup table for our local cache data so we can compare to
-    // remote manifest. We only want to update files that have changed to save
-    // some time.
-    let mut local_manifest_data: HashMap<PathBuf, LocalManifestFileEntry> = HashMap::new();
-    for entry in &local_manifest.files {
-        local_manifest_data.insert(PathBuf::from(&entry.path), entry.clone());
-    }
+        set_progress_text("Checking if files need updates");
+        set_progress_amount(0);
+        set_progress_total(remote_manifest.files.len());
 
-    let mut files_to_update = Vec::new();
-    for remote_entry in &remote_manifest.files {
-        let output_path = args.output.join(&remote_entry.source_path);
+        // Create a lookup table for our local cache data so we can compare to
+        // remote manifest. We only want to update files that have changed to save
+        // some time.
+        let mut local_manifest_data: HashMap<PathBuf, LocalManifestFileEntry> = HashMap::new();
+        for entry in &local_manifest.files {
+            local_manifest_data.insert(PathBuf::from(&entry.path), entry.clone());
+        }
 
-        let needs_update = || {
-            // If the force-recheck flag is set then all files will always be
-            // checked for updates regardless of the values in the local
-            // manifest.
-            if args.force_recheck {
-                return true;
+        let mut files_to_update = Vec::new();
+        for remote_entry in &remote_manifest.files {
+            add_progress_amount(1);
+
+            let output_path = args.output.join(&remote_entry.source_path);
+
+            let needs_update = || {
+                // If the force-recheck flag is set then all files will always be
+                // checked for updates regardless of the values in the local
+                // manifest.
+                if args.force_recheck {
+                    return true;
+                }
+
+                // If the local file does not already exist then it always needs to
+                // be downloaded.
+                if !output_path.exists() {
+                    return true;
+                }
+
+                // Otherwise, only files that have a different hash in the remote
+                // manifest should be updated.
+                if let Some(local_entry) =
+                    local_manifest_data.get(&PathBuf::from(&remote_entry.source_path))
+                {
+                    if local_entry.hash == remote_entry.source_hash {
+                        return false;
+                    }
+                }
+
+                true
+            };
+
+            if !needs_update() {
+                continue;
             }
 
-            // If the local file does not already exist then it always needs to
-            // be downloaded.
-            if !output_path.exists() {
-                return true;
-            }
+            let clone_url = remote_url.join(&remote_entry.path)?;
+            files_to_update.push((clone_url, output_path));
+        }
 
-            // Otherwise, only files that have a different hash in the remote
-            // manifest should be updated.
-            if let Some(local_entry) =
-                local_manifest_data.get(&PathBuf::from(&remote_entry.source_path))
-            {
-                if local_entry.hash == remote_entry.source_hash {
-                    return false;
+        set_progress_text("File checks completed");
+        set_progress_amount(1);
+        set_progress_total(1);
+
+        files_to_update
+    };
+
+    // Setup remote file downloaders for the files that need data. Each of these
+    // downloaders makes a network request to the remote archive to download
+    // chunk meta data so they need to be executed concurrently later for better
+    // performance.
+    let downloaders = {
+        tracing::debug!("Building downloaders");
+
+        let http_client = reqwest::Client::builder().build()?;
+
+        let mut downloaders = Vec::with_capacity(files_to_update.len());
+        for (file_url, file_path) in &files_to_update {
+            // Bitar doesn't handle text files well so when one of the text files
+            // has changed, it is deleted and the full file is downloaded from the
+            // remote archive.
+            if let Some(ext) = file_path.extension().and_then(|s| s.to_str()) {
+                if TEXT_FILE_EXTENSIONS.contains(&ext) {
+                    std::fs::remove_file(file_path).ok();
                 }
             }
 
-            true
-        };
+            let http_client = http_client.clone();
+            let file_path = file_path.clone();
+            let file_url = file_url.clone();
+            let progress_state = progress_state.clone();
 
-        if !needs_update() {
-            continue;
+            let downloader_task = tokio::spawn(async move {
+                progress_state
+                    .progress_amount
+                    .fetch_add(1, Ordering::SeqCst);
+
+                RemoteFileDownloader::new(&file_url, &file_path, http_client.clone()).await
+            });
+            downloaders.push(downloader_task);
         }
 
-        let clone_url = remote_url.join(&remote_entry.path)?;
-        files_to_update.push((clone_url, output_path));
-    }
+        // Create all the downloaders
+        set_progress_text("Downloading update metadata");
+        set_progress_amount(0);
+        set_progress_total(downloaders.len());
+
+        let downloaders: Vec<RemoteFileDownloader> = futures::future::try_join_all(downloaders)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        set_progress_text("Finished downloading update metadata");
+        set_progress_amount(1);
+        set_progress_total(1);
+
+        downloaders
+    };
 
     let mut verify_size = 0;
     let mut need_download_chunk_count = 0;
-
-    let mut downloaders = Vec::with_capacity(files_to_update.len());
-
-    tracing::debug!("Building downloaders");
-    for (file_url, file_path) in &files_to_update {
-        // Bitar doesn't handle text files well so when one of the text files
-        // has changed, it is deleted so the full file is downloaded from the
-        // remote archive.
-        if let Some(ext) = file_path.extension().and_then(|s| s.to_str()) {
-            if TEXT_FILE_EXTENSIONS.contains(&ext) {
-                std::fs::remove_file(file_path).ok();
-            }
-        }
-
-        let downloader = RemoteFileDownloader::new(file_url, file_path);
-        downloaders.push(downloader);
-    }
-
-    // Create all the downloaders
-    let downloaders = futures::future::try_join_all(downloaders).await?;
 
     // Verify local file chunks. If there is no existing file then there
     // will be no verifications
@@ -1141,7 +1186,7 @@ async fn save_local_manifest(manifest: &LocalManifest, manifest_path: &Path) -> 
     }
 
     let manifest_file = std::fs::File::create(manifest_path)?;
-    serde_json::to_writer(manifest_file, &manifest)?;
+    serde_json::to_writer(BufWriter::new(manifest_file), &manifest)?;
 
     Ok(())
 }
@@ -1150,12 +1195,17 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let log_level = if args.debug {
-        Level::DEBUG
+        LevelFilter::DEBUG
     } else {
-        Level::INFO
+        LevelFilter::INFO
     };
 
-    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
+    let filter = EnvFilter::builder()
+        .with_default_directive(log_level.into())
+        .from_env_lossy();
+
+    let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
+
     tracing::subscriber::set_global_default(subscriber)
         .expect("Critical failure: Failed to set default tracing subscriber");
 
