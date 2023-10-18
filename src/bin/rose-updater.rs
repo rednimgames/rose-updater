@@ -598,7 +598,7 @@ fn main() -> anyhow::Result<()> {
     let exe_dir = args.exe_dir.clone();
     let exe_args = args.exe_args.clone();
 
-    let use_beta = Rc::new(RefCell::new(true));
+    let use_beta = Rc::new(RefCell::new(settings.use_beta_client));
     {
         let use_beta = use_beta.clone();
         beta_checkbox.set_callback(move |beta_checkbox| {
