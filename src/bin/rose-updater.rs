@@ -1,8 +1,10 @@
 #![windows_subsystem = "windows"]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -11,6 +13,7 @@ use fltk::frame::Frame;
 use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
 use reqwest::Url;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::fs::File;
 use tracing::{debug, error, info, Level};
@@ -28,6 +31,19 @@ const LOCAL_MANIFEST_VERSION: usize = 1;
 const UPDATER_OLD_EXT: &str = "old";
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
+
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    use_beta_client: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            use_beta_client: true,
+        }
+    }
+}
 
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
@@ -480,6 +496,25 @@ fn main() -> anyhow::Result<()> {
             .expect("Critical failure: Failed to set default tracing subscriber");
     }
 
+    // Load application settings
+    let settings_dir = directories::ProjectDirs::from("", "Rednim Games", "ROSE Online")
+        .and_then(|d| Some(d.config_dir().to_owned()))
+        .unwrap_or(PathBuf::from("."));
+
+    let settings_path = settings_dir.join("rose-updater.json");
+    tracing::info!(path =? settings_path.display(), "Loading updater settings");
+
+    let mut settings = if let Ok(saved_settings) = std::fs::read(&settings_path)
+        .map_err(|e| anyhow::anyhow!(e))
+        .and_then(|data| Ok(serde_json::from_slice(&data)?))
+    {
+        saved_settings
+    } else {
+        // Remove the bad json file if it exists
+        let _ = std::fs::remove_file(&settings_path);
+        Settings::default()
+    };
+
     // Load application resources
     let icon_bytes = include_bytes!("../../res/client.png");
     let background_bytes = include_bytes!("../../res/Launcher_Alpha_Background.png");
@@ -502,6 +537,12 @@ fn main() -> anyhow::Result<()> {
 
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
     launch_button.deactivate();
+
+    let mut beta_checkbox = fltk::button::CheckButton::new(610, 605, 120, 20, "Use Beta Client");
+    beta_checkbox.set_label_color(fltk::enums::Color::White);
+    beta_checkbox.set_label_type(fltk::enums::LabelType::Shadow);
+    beta_checkbox.set_checked(settings.use_beta_client);
+    beta_checkbox.set_tooltip("Enable the new beta client when starting the game. Leaving this unchecked will launch the old version");
 
     let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
     webview_win.set_border(false);
@@ -557,6 +598,21 @@ fn main() -> anyhow::Result<()> {
     let exe_dir = args.exe_dir.clone();
     let exe_args = args.exe_args.clone();
 
+    let use_beta = Rc::new(RefCell::new(settings.use_beta_client));
+    {
+        let use_beta = use_beta.clone();
+        beta_checkbox.set_callback(move |beta_checkbox| {
+            *use_beta.borrow_mut() = beta_checkbox.is_checked();
+
+            settings.use_beta_client = beta_checkbox.is_checked();
+
+            let _ = std::fs::create_dir_all(&settings_dir);
+            if let Ok(data) = serde_json::to_vec(&settings) {
+                let _ = std::fs::write(&settings_path, data);
+            };
+        });
+    }
+
     // When the launch button is clicked we start the application
     launch_button.set_callback(move |_| {
         info!(
@@ -565,6 +621,13 @@ fn main() -> anyhow::Result<()> {
             exe.display(),
             exe_args.join(" ")
         );
+
+        let use_beta = *use_beta.borrow();
+        let exe = if use_beta {
+            exe_dir.join("trose-new.exe")
+        } else {
+            exe_dir.join(&exe)
+        };
 
         Command::new(&exe)
             .current_dir(&exe_dir)
@@ -614,6 +677,7 @@ fn main() -> anyhow::Result<()> {
                         background_frame.redraw();
                         main_progress_bar.redraw();
                         launch_button.redraw();
+                        beta_checkbox.redraw();
                     }
                     MainProgressUpdaterEvent::IncrementProgress(amount) => {
                         main_progress_bar.set_value(main_progress_bar.value() + amount);
