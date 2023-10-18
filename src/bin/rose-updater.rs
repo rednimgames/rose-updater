@@ -1,8 +1,10 @@
 #![windows_subsystem = "windows"]
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -503,6 +505,12 @@ fn main() -> anyhow::Result<()> {
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
     launch_button.deactivate();
 
+    let mut beta_checkbox = fltk::button::CheckButton::new(610, 605, 120, 20, "Use Beta Client");
+    beta_checkbox.set_label_color(fltk::enums::Color::White);
+    beta_checkbox.set_label_type(fltk::enums::LabelType::Shadow);
+    beta_checkbox.set_checked(true);
+    beta_checkbox.set_tooltip("Enable the new beta client when starting the game. Leaving this unchecked will launch the old version");
+
     let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
     webview_win.set_border(false);
     webview_win.set_frame(FrameType::NoBox);
@@ -557,6 +565,14 @@ fn main() -> anyhow::Result<()> {
     let exe_dir = args.exe_dir.clone();
     let exe_args = args.exe_args.clone();
 
+    let use_beta = Rc::new(RefCell::new(true));
+    {
+        let use_beta = use_beta.clone();
+        beta_checkbox.set_callback(move |beta_checkbox| {
+            *use_beta.borrow_mut() = beta_checkbox.is_checked();
+        });
+    }
+
     // When the launch button is clicked we start the application
     launch_button.set_callback(move |_| {
         info!(
@@ -565,6 +581,12 @@ fn main() -> anyhow::Result<()> {
             exe.display(),
             exe_args.join(" ")
         );
+
+        let exe = if *use_beta.borrow() {
+            exe_dir.join("trose-new.exe")
+        } else {
+            exe_dir.join(&exe)
+        };
 
         Command::new(&exe)
             .current_dir(&exe_dir)
@@ -614,6 +636,7 @@ fn main() -> anyhow::Result<()> {
                         background_frame.redraw();
                         main_progress_bar.redraw();
                         launch_button.redraw();
+                        beta_checkbox.redraw();
                     }
                     MainProgressUpdaterEvent::IncrementProgress(amount) => {
                         main_progress_bar.set_value(main_progress_bar.value() + amount);
