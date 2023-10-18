@@ -22,9 +22,32 @@ pub struct LocalManifest {
     pub files: Vec<LocalManifestFileEntry>,
 }
 
+impl From<&RemoteManifest> for LocalManifest {
+    fn from(remote_manifest: &RemoteManifest) -> Self {
+        LocalManifest {
+            version: remote_manifest.version,
+            updater: (&remote_manifest.updater).into(),
+            files: remote_manifest
+                .files
+                .iter()
+                .map(|remote_entry| remote_entry.into())
+                .collect(),
+        }
+    }
+}
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct LocalManifestFileEntry {
     pub path: String,
     pub hash: Vec<u8>,
     pub size: usize,
+}
+
+impl From<&RemoteManifestFileEntry> for LocalManifestFileEntry {
+    fn from(remote_entry: &RemoteManifestFileEntry) -> Self {
+        LocalManifestFileEntry {
+            path: remote_entry.source_path.clone(),
+            hash: remote_entry.source_hash.clone(),
+            size: remote_entry.source_size,
+        }
+    }
 }

@@ -114,6 +114,12 @@ async fn main() -> anyhow::Result<()> {
         let mut input_file = File::open(&input_path).await?;
         let mut output_file = File::create(&output_path).await?;
 
+        let compression = if args.compression_level == 0 {
+            None
+        } else {
+            Some(bitar::Compression::zstd(args.compression_level)?)
+        };
+
         let options = bitar::api::compress::CreateArchiveOptions {
             chunker_config: bitar::chunker::Config::RollSum(bitar::chunker::FilterConfig {
                 filter_bits: bitar::chunker::FilterBits::from_size(64 * 1024),
@@ -121,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 max_chunk_size: 16 * 1024 * 1024,
                 window_size: 64,
             }),
-            compression: Some(bitar::Compression::zstd(args.compression_level)?),
+            compression,
             ..Default::default()
         };
 
