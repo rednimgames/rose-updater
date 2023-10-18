@@ -759,8 +759,18 @@ fn draw_progress_bar(ui: &mut egui::Ui, state: &UiState) {
 
     egui::Image::new(fg_image_source).paint_at(ui, fg_rect);
 
+    let text_with_percentage = if progress_percentage < 1.0 {
+        format!(
+            "{} ({:0.2}%)",
+            &state.progress_text,
+            progress_percentage * 100.0
+        )
+    } else {
+        state.progress_text.clone()
+    };
+
     // Draw text on progress bar
-    let text = egui::WidgetText::from(&state.progress_text);
+    let text = egui::WidgetText::from(&text_with_percentage);
     let galley = text.into_galley(ui, Some(false), f32::INFINITY, egui::TextStyle::Button);
     let text_pos = bg.center() - egui::vec2(0.0, galley.size().y / 2.0);
     let text_color = egui::Color32::WHITE;
@@ -1053,11 +1063,14 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
             let progress_state = progress_state.clone();
 
             let downloader_task = tokio::spawn(async move {
+                let downloader =
+                    RemoteFileDownloader::new(&file_url, &file_path, http_client.clone()).await;
+
                 progress_state
                     .progress_amount
                     .fetch_add(1, Ordering::SeqCst);
 
-                RemoteFileDownloader::new(&file_url, &file_path, http_client.clone()).await
+                downloader
             });
             downloaders.push(downloader_task);
         }
