@@ -32,17 +32,9 @@ const UPDATER_OLD_EXT: &str = "old";
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct Settings {
-    use_beta_client: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Settings {
-        Settings {
-            use_beta_client: true,
-        }
-    }
+    use_legacy_client: bool,
 }
 
 #[derive(Clone, Parser, Debug)]
@@ -538,11 +530,12 @@ fn main() -> anyhow::Result<()> {
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
     launch_button.deactivate();
 
-    let mut beta_checkbox = fltk::button::CheckButton::new(610, 605, 120, 20, "Use Beta Client");
-    beta_checkbox.set_label_color(fltk::enums::Color::White);
-    beta_checkbox.set_label_type(fltk::enums::LabelType::Shadow);
-    beta_checkbox.set_checked(settings.use_beta_client);
-    beta_checkbox.set_tooltip("Enable the new beta client when starting the game. Leaving this unchecked will launch the old version");
+    let mut legacy_checkbox =
+        fltk::button::CheckButton::new(610, 605, 120, 20, "Use Legacy Client");
+    legacy_checkbox.set_label_color(fltk::enums::Color::White);
+    legacy_checkbox.set_label_type(fltk::enums::LabelType::Shadow);
+    legacy_checkbox.set_checked(settings.use_legacy_client);
+    legacy_checkbox.set_tooltip("Enable the old legacy client when starting the game. Leaving this unchecked will launch the old version");
 
     let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
     webview_win.set_border(false);
@@ -598,13 +591,13 @@ fn main() -> anyhow::Result<()> {
     let exe_dir = args.exe_dir.clone();
     let exe_args = args.exe_args.clone();
 
-    let use_beta = Rc::new(RefCell::new(settings.use_beta_client));
+    let use_legacy = Rc::new(RefCell::new(settings.use_legacy_client));
     {
-        let use_beta = use_beta.clone();
-        beta_checkbox.set_callback(move |beta_checkbox| {
-            *use_beta.borrow_mut() = beta_checkbox.is_checked();
+        let use_legacy = use_legacy.clone();
+        legacy_checkbox.set_callback(move |legacy_checkbox| {
+            *use_legacy.borrow_mut() = legacy_checkbox.is_checked();
 
-            settings.use_beta_client = beta_checkbox.is_checked();
+            settings.use_legacy_client = legacy_checkbox.is_checked();
 
             let _ = std::fs::create_dir_all(&settings_dir);
             if let Ok(data) = serde_json::to_vec(&settings) {
@@ -622,9 +615,9 @@ fn main() -> anyhow::Result<()> {
             exe_args.join(" ")
         );
 
-        let use_beta = *use_beta.borrow();
-        let exe = if use_beta {
-            exe_dir.join("trose-new.exe")
+        let use_legacy = *use_legacy.borrow();
+        let exe = if use_legacy {
+            exe_dir.join("trose-legacy.exe")
         } else {
             exe_dir.join(&exe)
         };
@@ -677,7 +670,7 @@ fn main() -> anyhow::Result<()> {
                         background_frame.redraw();
                         main_progress_bar.redraw();
                         launch_button.redraw();
-                        beta_checkbox.redraw();
+                        legacy_checkbox.redraw();
                     }
                     MainProgressUpdaterEvent::IncrementProgress(amount) => {
                         main_progress_bar.set_value(main_progress_bar.value() + amount);
