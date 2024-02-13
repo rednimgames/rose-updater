@@ -22,6 +22,7 @@ impl ProgressBar {
         let progress_bar_bytes = include_bytes!("../res/Launcher_Alpha_LoadingBar.png");
         let font_bytes = include_bytes!("../res/JosefinSans-Bold.ttf");
         let black_bytes = include_bytes!("../res/ariblk.ttf");
+        #[allow(invalid_from_utf8_unchecked)]
         unsafe {
             Font::set_font(Font::Helvetica, std::str::from_utf8_unchecked(font_bytes));
             Font::set_font(Font::Courier, std::str::from_utf8_unchecked(black_bytes));
