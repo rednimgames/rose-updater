@@ -6,7 +6,7 @@ use fltk::enums::{Align, Color, Font, FrameType};
 use fltk::frame::*;
 use fltk::image::*;
 use fltk::{draw, prelude::*};
-use humansize::{file_size_opts, FileSize};
+use humansize::{format_size, DECIMAL};
 
 pub struct ProgressBar {
     bar: Frame,
@@ -93,8 +93,8 @@ impl ProgressBar {
                 // underneath total size
                 let data_size = format!(
                     "{} / {}",
-                    value.file_size(file_size_opts::CONVENTIONAL).unwrap(),
-                    max.file_size(file_size_opts::CONVENTIONAL).unwrap()
+                    format_size(value, DECIMAL),
+                    format_size(max, DECIMAL)
                 );
                 let data_size = if is_zero {
                     "- B / - B".to_string()

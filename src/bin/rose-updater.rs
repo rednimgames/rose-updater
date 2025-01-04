@@ -1,10 +1,8 @@
 #![windows_subsystem = "windows"]
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -12,8 +10,8 @@ use clap::Parser;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
+use fltk_webview::FromFltkWindow;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::fs::File;
 use tracing::{debug, error, info, Level};
@@ -74,7 +72,6 @@ struct Args {
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
     #[clap(
-        multiple_values = true,
         default_value = "--init --server connect.roseonlinegame.com",
         value_delimiter = ' '
     )]
