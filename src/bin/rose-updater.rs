@@ -17,7 +17,6 @@ use tokio::fs::File;
 use tracing::{debug, error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-
 use rose_update::{
     clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry,
     RemoteManifest, RemoteManifestFileEntry, Updater,
@@ -462,7 +461,8 @@ impl Updater for MainProgressUpdater {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Setup tracing for logging
@@ -569,10 +569,8 @@ fn main() -> anyhow::Result<()> {
         app.quit();
     });
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     // Spawn a task to download our updates
-    let process_future = rt.spawn(async move {
+    let process_future = tokio::spawn(async move {
         let result = process(&args, main_updater, shutdown_rx).await;
         if let Ok(download_result) = result {
             info!("Download task completed");
@@ -639,17 +637,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    rt.block_on(async move {
-        let result = shutdown_tx.send(true);
-        if result.is_err() {
-            info!("Failed to send shutdown message");
-        }
-    });
-
-    let result = rt.block_on(process_future);
-    if result.is_err() {
-        error!("Error while closing down download process");
-    }
+    shutdown_tx.send(true)?;
+    process_future.await?;
 
     Ok(())
 }
