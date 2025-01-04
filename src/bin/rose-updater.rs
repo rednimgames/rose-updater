@@ -17,8 +17,6 @@ use tokio::fs::File;
 use tracing::{debug, error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-#[cfg(feature = "console")]
-use console_subscriber;
 
 use rose_update::{
     clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry,
@@ -467,18 +465,12 @@ impl Updater for MainProgressUpdater {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Setup tracing for loggin
-
-    if cfg!(feature = "console") {
-        #[cfg(feature = "console")]
-        console_subscriber::init();
-    } else {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(Level::INFO)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Critical failure: Failed to set default tracing subscriber");
-    }
+    // Setup tracing for logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Critical failure: Failed to set default tracing subscriber");
 
     // Load application resources
     let icon_bytes = include_bytes!("../../res/client.png");

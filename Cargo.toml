@@ -39,6 +39,3 @@ windows = { version = "0.39.0", features = ["Win32_System_Threading"] }
 [build-dependencies]
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
-
-[features]
-console = ["tokio/tracing", "console-subscriber"]
