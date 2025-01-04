@@ -7,28 +7,28 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-bitar = { version = "0.10.0", features = ["compress", "zstd-compression"] }
-clap = { version = "3.2.16", features = ["derive"] }
-directories = "4.0"
-fltk = "1.3"
-fltk-webview = "0.2"
+bitar = { version = "0.12.0", features = ["compress", "zstd-compression"] }
+clap = { version = "4.5.23", features = ["derive"] }
+directories = "5.0"
+fltk = "1.5"
+fltk-webview = "0.4"
 futures = "0.3"
-humansize = "1.1"
+humansize = "2.1"
 path-slash = "0.2.1"
-open = "3.0"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+open = "5"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = "0.2"
+tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["full"] }
 walkdir = "2"
 
 # Only needed for bitar_ext
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-# Feature: console
-console-subscriber = { version = "0.1.7", optional = true}
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.39.0", features = ["Win32_System_Threading"] }
@@ -36,6 +36,3 @@ windows = { version = "0.39.0", features = ["Win32_System_Threading"] }
 [build-dependencies]
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
-
-[features]
-console = ["tokio/tracing", "console-subscriber"]

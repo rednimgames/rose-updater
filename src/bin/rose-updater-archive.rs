@@ -52,7 +52,7 @@ struct Args {
     manifest_name: String,
 
     /// Compression level to use (0 to 22)
-    #[clap(long, default_value="4", parse(try_from_str=parse_compression_level))]
+    #[clap(long, default_value="4", value_parser=parse_compression_level)]
     compression_level: u32,
 
     /// Relative path to the updater program in the input directory

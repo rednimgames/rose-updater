@@ -1,10 +1,8 @@
 #![windows_subsystem = "windows"]
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
@@ -12,15 +10,12 @@ use clap::Parser;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
+use fltk_webview::FromFltkWindow;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::fs::File;
 use tracing::{debug, error, info, Level};
 use tracing_subscriber::FmtSubscriber;
-
-#[cfg(feature = "console")]
-use console_subscriber;
 
 use rose_update::{
     clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry,
@@ -74,7 +69,6 @@ struct Args {
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
     #[clap(
-        multiple_values = true,
         default_value = "--init --server connect.roseonlinegame.com",
         value_delimiter = ' '
     )]
@@ -467,21 +461,16 @@ impl Updater for MainProgressUpdater {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Setup tracing for loggin
-
-    if cfg!(feature = "console") {
-        #[cfg(feature = "console")]
-        console_subscriber::init();
-    } else {
-        let subscriber = FmtSubscriber::builder()
-            .with_max_level(Level::INFO)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Critical failure: Failed to set default tracing subscriber");
-    }
+    // Setup tracing for logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Critical failure: Failed to set default tracing subscriber");
 
     // Load application resources
     let icon_bytes = include_bytes!("../../res/client.png");
@@ -580,10 +569,8 @@ fn main() -> anyhow::Result<()> {
         app.quit();
     });
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     // Spawn a task to download our updates
-    let process_future = rt.spawn(async move {
+    let process_future = tokio::spawn(async move {
         let result = process(&args, main_updater, shutdown_rx).await;
         if let Ok(download_result) = result {
             info!("Download task completed");
@@ -650,17 +637,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    rt.block_on(async move {
-        let result = shutdown_tx.send(true);
-        if result.is_err() {
-            info!("Failed to send shutdown message");
-        }
-    });
-
-    let result = rt.block_on(process_future);
-    if result.is_err() {
-        error!("Error while closing down download process");
-    }
+    shutdown_tx.send(true)?;
+    process_future.await?;
 
     Ok(())
 }

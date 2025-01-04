@@ -20,11 +20,13 @@ pub trait Updater {
 pub async fn clone_remote<T: Updater>(
     url: &Url,
     output_path: &Path,
-    updater: T
+    updater: T,
 ) -> anyhow::Result<()> {
     let http_reader = HttpReader::from_url(url.clone()).retries(4);
 
-    let mut archive = Archive::try_init(http_reader).await.context(format!("Failed to read archive at {}", &url))?;
+    let mut archive = Archive::try_init(http_reader)
+        .await
+        .context(format!("Failed to read archive at {}", &url))?;
 
     // Create parent directory
     if let Some(output_parent) = output_path.parent() {
@@ -36,6 +38,7 @@ pub async fn clone_remote<T: Updater>(
         .create(true)
         .write(true)
         .read(true)
+        .truncate(true)
         .open(&output_path)
         .await
         .context(format!(
