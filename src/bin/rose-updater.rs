@@ -277,15 +277,24 @@ fn get_remote_files(
                 res = clone_remote(
                     &clone_url,
                     &output_path,
-                    main_updater) => if res.is_ok() {
-                        info!("Cloned {} to {}", &clone_url, output_path.display());
-                        cloned_tx.send(LocalManifestFileEntry {
-                            path: remote_entry.source_path.clone(),
-                            hash: remote_entry.source_hash.clone(),
-                            size: remote_entry.source_size,
-                        }).await.expect("Failed to send clone message");
-                    } else {
-                        error!("Failed to clone {}", &clone_url);
+                    main_updater) => {
+                        match res {
+                            Ok(_) => {
+                                info!("Cloned {} to {}", clone_url, output_path.display());
+                                let clone_message = LocalManifestFileEntry {
+                                    path: remote_entry.source_path.clone(),
+                                    hash: remote_entry.source_hash.clone(),
+                                    size: remote_entry.source_size,
+                                };
+
+                                if let Err(err) = cloned_tx.send(clone_message).await {
+                                    error!("Failed to send clone message: {}", err);
+                                }
+                            }
+                            Err(err) => {
+                                error!("Failed to clone {}: {}", clone_url, err);
+                            }
+                        }
                     },
                 _ = cloned_shutdown.changed() => {
                     info!("Stopped cloning {}", &clone_url);
