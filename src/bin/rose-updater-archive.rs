@@ -55,6 +55,10 @@ struct Args {
     #[clap(long, default_value="4", value_parser=parse_compression_level)]
     compression_level: u32,
 
+    /// Chunk size in bytes
+    #[clap(long, default_value = "1000000")]
+    chunk_size: usize,
+
     /// Relative path to the updater program in the input directory
     #[clap(long, default_value = "rose-updater.exe")]
     updater: PathBuf,
@@ -115,12 +119,7 @@ async fn main() -> anyhow::Result<()> {
         let mut output_file = File::create(&output_path).await?;
 
         let options = bitar::api::compress::CreateArchiveOptions {
-            chunker_config: bitar::chunker::Config::RollSum(bitar::chunker::FilterConfig {
-                filter_bits: bitar::chunker::FilterBits::from_size(64 * 1024),
-                min_chunk_size: 16 * 1024,
-                max_chunk_size: 16 * 1024 * 1024,
-                window_size: 64,
-            }),
+            chunker_config: bitar::chunker::Config::FixedSize(args.chunk_size),
             compression: Some(bitar::Compression::zstd(args.compression_level)?),
             ..Default::default()
         };
