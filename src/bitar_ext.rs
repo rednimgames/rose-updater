@@ -38,7 +38,7 @@ pub async fn clone_remote<T: Updater>(
         .create(true)
         .write(true)
         .read(true)
-        .truncate(true)
+        .truncate(false)
         .open(&output_path)
         .await
         .context(format!(
