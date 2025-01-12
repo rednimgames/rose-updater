@@ -1,4 +1,5 @@
-#![windows_subsystem = "windows"]
+use core::arch;
+//#![windows_subsystem = "windows"]
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use bitar::{ChunkIndex, CloneOutput};
 use clap::Parser;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
@@ -18,8 +20,10 @@ use tracing::{debug, error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use rose_update::{
-    clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry,
-    RemoteManifest, RemoteManifestFileEntry, Updater,
+    build_local_chunk_index, clone_remote, clone_remote_file, estimate_local_chunk_count,
+    init_local_clone_output, init_remote_archive_reader, launch_button, progress_bar,
+    LocalManifest, LocalManifestFileEntry, RemoteArchiveReader, RemoteManifest,
+    RemoteManifestFileEntry, Updater,
 };
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
@@ -66,6 +70,10 @@ struct Args {
     #[clap(long, default_value = "trose.exe")]
     exe: PathBuf,
 
+    /// Working directory to run the executable
+    #[clap(long, default_value = ".")]
+    exe_dir: PathBuf,
+
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
     #[clap(
@@ -73,10 +81,6 @@ struct Args {
         value_delimiter = ' '
     )]
     exe_args: Vec<String>,
-
-    /// Working directory to run the executable
-    #[clap(long, default_value = ".")]
-    exe_dir: PathBuf,
 }
 
 async fn save_local_manifest(manifest_path: &Path, manfiest: &LocalManifest) -> anyhow::Result<()> {
@@ -240,69 +244,180 @@ fn verify_local_files(
     })
 }
 
-fn get_remote_files(
-    output: &Path,
+async fn get_remote_files(
+    output_dir: &Path,
     files_to_update: Vec<(Url, RemoteManifestFileEntry)>,
     main_updater: MainProgressUpdater,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     tx: tokio::sync::mpsc::Sender<LocalManifestFileEntry>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
-    let mut clone_tasks = Vec::new();
+    info!(count = files_to_update.len(), "Starting clone process");
 
-    for entry in files_to_update {
-        let (clone_url, remote_entry) = entry;
-        let main_updater = main_updater.clone();
-        let output_path = output.join(&remote_entry.source_path);
-        let mut cloned_shutdown = shutdown_rx.clone();
-        let cloned_tx = tx.clone();
-
-        // Bitar doesn't handle text files well so when one of the text files
-        // has changed, we delete it first so bitar will just redownload the
-        // whole file.
-        if let Some(ext) = output_path.extension().and_then(|s| s.to_str()) {
-            if TEXT_FILE_EXTENSIONS.contains(&ext) {
-                if let Err(e) = std::fs::remove_file(&output_path) {
-                    error!(
-                        path =? output_path.display(),
-                        error =? e,
-                        "Failed to delete text file"
-                    )
-                }
-            }
+    let mut archive_readers = {
+        let mut archive_reader_tasks = Vec::new();
+        for (remote_url, _) in &files_to_update {
+            let archive_reader_task = init_remote_archive_reader(remote_url);
+            archive_reader_tasks.push(archive_reader_task);
         }
 
-        clone_tasks.push(tokio::spawn(async move {
-            info!("Downloading {}", &clone_url);
-            tokio::select! {
-                res = clone_remote(
-                    &clone_url,
-                    &output_path,
-                    main_updater) => {
-                        match res {
-                            Ok(_) => {
-                                info!("Cloned {} to {}", clone_url, output_path.display());
-                                let clone_message = LocalManifestFileEntry {
-                                    path: remote_entry.source_path.clone(),
-                                    hash: remote_entry.source_hash.clone(),
-                                    size: remote_entry.source_size,
-                                };
+        let archive_readers: anyhow::Result<Vec<RemoteArchiveReader>> =
+            futures::future::join_all(archive_reader_tasks)
+                .await
+                .into_iter()
+                .collect();
+        archive_readers?
+    };
 
-                                if let Err(err) = cloned_tx.send(clone_message).await {
-                                    error!("Failed to send clone message: {}", err);
-                                }
-                            }
-                            Err(err) => {
-                                error!("Failed to clone {}: {}", clone_url, err);
-                            }
-                        }
-                    },
-                _ = cloned_shutdown.changed() => {
-                    info!("Stopped cloning {}", &clone_url);
-                }
-            }
-        }));
+    info!(count = archive_readers.len(), "Remote Archives Initialized");
+
+    let local_file_paths: Vec<_> = files_to_update
+        .iter()
+        .map(|(_, remote_manifest_entry)| output_dir.join(&remote_manifest_entry.source_path))
+        .collect();
+
+    let mut total_local_chunk_count = 0;
+    for (archive_reader, local_file_path) in archive_readers.iter().zip(&local_file_paths) {
+        total_local_chunk_count +=
+            estimate_local_chunk_count(archive_reader, &local_file_path).await?;
     }
 
+    info!(
+        chunk_count = total_local_chunk_count,
+        "Building local chunk indexes"
+    );
+
+    main_updater
+        .set_max_progress(total_local_chunk_count as usize)
+        .await;
+
+    let chunk_indexes = {
+        let chunk_index_tasks: Vec<_> = archive_readers
+            .iter()
+            .zip(&local_file_paths)
+            .map(|(archive_reader, local_file_path)| {
+                build_local_chunk_index(archive_reader, &local_file_path, main_updater.clone())
+            })
+            .collect();
+
+        let chunk_indexes: anyhow::Result<Vec<ChunkIndex>> =
+            futures::future::join_all(chunk_index_tasks)
+                .await
+                .into_iter()
+                .collect();
+
+        chunk_indexes?
+    };
+
+    info!(
+        clone_output_count = archive_readers.len(),
+        "Initializing clone outputs"
+    );
+
+    let mut clone_outputs = {
+        let clone_output_tasks = archive_readers
+            .iter()
+            .zip(&local_file_paths)
+            .zip(chunk_indexes)
+            .map(|((archive_reader, local_file_path), local_chunk_index)| {
+                init_local_clone_output(archive_reader, local_file_path, local_chunk_index)
+            });
+
+        let clone_outputs: anyhow::Result<Vec<CloneOutput<tokio::fs::File>>> =
+            futures::future::join_all(clone_output_tasks)
+                .await
+                .into_iter()
+                .collect();
+
+        clone_outputs?
+    };
+
+    let total_download_chunk_count = clone_outputs
+        .iter()
+        .fold(0, |acc, clone_output| acc + clone_output.chunks().len());
+
+    info!(
+        chunk_count = total_download_chunk_count,
+        "Downloading missing chunks"
+    );
+
+    main_updater
+        .set_max_progress(total_download_chunk_count as usize)
+        .await;
+
+    {
+        let clone_tasks = archive_readers
+            .iter_mut()
+            .zip(clone_outputs.iter_mut())
+            .map(|(archive_reader, clone_output)| {
+                clone_remote_file(archive_reader, clone_output, main_updater.clone())
+            });
+
+        let clone_results: anyhow::Result<Vec<()>> = futures::future::join_all(clone_tasks)
+            .await
+            .into_iter()
+            .collect();
+
+        clone_results?;
+    }
+
+    // TODO: We need to add back the special handling for XML files
+    // TODO: If you close the app mid download it doesn't fully close
+
+    // for entry in files_to_update {
+    //     let (clone_url, remote_entry) = entry;
+    //     let main_updater = main_updater.clone();
+    //     let output_path = output_dir.join(&remote_entry.source_path);
+    //     let mut cloned_shutdown = shutdown_rx.clone();
+    //     let cloned_tx = tx.clone();
+
+    //     // Bitar doesn't handle text files well so when one of the text files
+    //     // has changed, we delete it first so bitar will just redownload the
+    //     // whole file.
+    //     if let Some(ext) = output_path.extension().and_then(|s| s.to_str()) {
+    //         if TEXT_FILE_EXTENSIONS.contains(&ext) {
+    //             if let Err(e) = std::fs::remove_file(&output_path) {
+    //                 error!(
+    //                     path =? output_path.display(),
+    //                     error =? e,
+    //                     "Failed to delete text file"
+    //                 )
+    //             }
+    //         }
+    //     }
+
+    //     clone_tasks.push(tokio::spawn(async move {
+    //         info!("Downloading {}", &clone_url);
+    //         tokio::select! {
+    //             res = clone_remote(
+    //                 &clone_url,
+    //                 &output_path,
+    //                 main_updater) => {
+    //                     match res {
+    //                         Ok(_) => {
+    //                             info!("Cloned {} to {}", clone_url, output_path.display());
+    //                             let clone_message = LocalManifestFileEntry {
+    //                                 path: remote_entry.source_path.clone(),
+    //                                 hash: remote_entry.source_hash.clone(),
+    //                                 size: remote_entry.source_size,
+    //                             };
+
+    //                             if let Err(err) = cloned_tx.send(clone_message).await {
+    //                                 error!("Failed to send clone message: {}", err);
+    //                             }
+    //                         }
+    //                         Err(err) => {
+    //                             error!("Failed to clone {}: {}", clone_url, err);
+    //                         }
+    //                     }
+    //                 },
+    //             _ = cloned_shutdown.changed() => {
+    //                 info!("Stopped cloning {}", &clone_url);
+    //             }
+    //         }
+    //     }));
+    // }
+
+    let clone_tasks = Vec::new();
     Ok(clone_tasks)
 }
 
@@ -420,7 +535,7 @@ async fn process(
     });
 
     let clone_tasks =
-        get_remote_files(&args.output, files_to_update, main_updater, shutdown_rx, tx)?;
+        get_remote_files(&args.output, files_to_update, main_updater, shutdown_rx, tx).await?;
 
     futures::future::join_all(clone_tasks).await;
     let (hash_new_local_manifest, mut new_local_manifest) = work.await?;
