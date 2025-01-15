@@ -1,6 +1,5 @@
-use core::arch;
 //#![windows_subsystem = "windows"]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,7 +195,7 @@ struct VerificationResults {
 fn verify_local_files(
     output: &Path,
     remote_url: &Url,
-    remote_manifest: RemoteManifest,
+    remote_manifest: &RemoteManifest,
     local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>,
     force_verify: bool,
 ) -> anyhow::Result<VerificationResults> {
@@ -205,7 +204,7 @@ fn verify_local_files(
     let mut files_to_update = Vec::new();
     let mut total_size = 0;
     let mut already_downloaded_size = 0;
-    for remote_entry in remote_manifest.files {
+    for remote_entry in &remote_manifest.files {
         let output_path = output.join(&remote_entry.source_path);
         let needs_update = || {
             if !output_path.exists() {
@@ -234,7 +233,7 @@ fn verify_local_files(
         }
 
         let clone_url = remote_url.join(&remote_entry.path)?;
-        files_to_update.push((clone_url, remote_entry));
+        files_to_update.push((clone_url, remote_entry.clone()));
     }
 
     Ok(VerificationResults {
@@ -248,9 +247,7 @@ async fn get_remote_files(
     output_dir: &Path,
     files_to_update: Vec<(Url, RemoteManifestFileEntry)>,
     main_updater: MainProgressUpdater,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    tx: tokio::sync::mpsc::Sender<LocalManifestFileEntry>,
-) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+) -> anyhow::Result<()> {
     info!(count = files_to_update.len(), "Starting clone process");
 
     let mut archive_readers = {
@@ -274,6 +271,23 @@ async fn get_remote_files(
         .iter()
         .map(|(_, remote_manifest_entry)| output_dir.join(&remote_manifest_entry.source_path))
         .collect();
+
+    // Bitar doesn't handle text files well so when one of the text files
+    // has changed, we delete it first so bitar will just redownload the
+    // whole file.
+    for path in &local_file_paths {
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+            if TEXT_FILE_EXTENSIONS.contains(&ext) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    error!(
+                        path =? path.display(),
+                        error =? e,
+                        "Failed to delete text file"
+                    )
+                }
+            }
+        }
+    }
 
     let mut total_local_chunk_count = 0;
     for (archive_reader, local_file_path) in archive_readers.iter().zip(&local_file_paths) {
@@ -360,65 +374,7 @@ async fn get_remote_files(
         clone_results?;
     }
 
-    // TODO: We need to add back the special handling for XML files
-    // TODO: If you close the app mid download it doesn't fully close
-
-    // for entry in files_to_update {
-    //     let (clone_url, remote_entry) = entry;
-    //     let main_updater = main_updater.clone();
-    //     let output_path = output_dir.join(&remote_entry.source_path);
-    //     let mut cloned_shutdown = shutdown_rx.clone();
-    //     let cloned_tx = tx.clone();
-
-    //     // Bitar doesn't handle text files well so when one of the text files
-    //     // has changed, we delete it first so bitar will just redownload the
-    //     // whole file.
-    //     if let Some(ext) = output_path.extension().and_then(|s| s.to_str()) {
-    //         if TEXT_FILE_EXTENSIONS.contains(&ext) {
-    //             if let Err(e) = std::fs::remove_file(&output_path) {
-    //                 error!(
-    //                     path =? output_path.display(),
-    //                     error =? e,
-    //                     "Failed to delete text file"
-    //                 )
-    //             }
-    //         }
-    //     }
-
-    //     clone_tasks.push(tokio::spawn(async move {
-    //         info!("Downloading {}", &clone_url);
-    //         tokio::select! {
-    //             res = clone_remote(
-    //                 &clone_url,
-    //                 &output_path,
-    //                 main_updater) => {
-    //                     match res {
-    //                         Ok(_) => {
-    //                             info!("Cloned {} to {}", clone_url, output_path.display());
-    //                             let clone_message = LocalManifestFileEntry {
-    //                                 path: remote_entry.source_path.clone(),
-    //                                 hash: remote_entry.source_hash.clone(),
-    //                                 size: remote_entry.source_size,
-    //                             };
-
-    //                             if let Err(err) = cloned_tx.send(clone_message).await {
-    //                                 error!("Failed to send clone message: {}", err);
-    //                             }
-    //                         }
-    //                         Err(err) => {
-    //                             error!("Failed to clone {}: {}", clone_url, err);
-    //                         }
-    //                     }
-    //                 },
-    //             _ = cloned_shutdown.changed() => {
-    //                 info!("Stopped cloning {}", &clone_url);
-    //             }
-    //         }
-    //     }));
-    // }
-
-    let clone_tasks = Vec::new();
-    Ok(clone_tasks)
+    Ok(())
 }
 
 async fn process(
@@ -506,7 +462,7 @@ async fn process(
     } = verify_local_files(
         &args.output,
         &remote_url,
-        remote_manifest,
+        &remote_manifest,
         &current_local_filedata,
         args.verify,
     )?;
@@ -516,34 +472,20 @@ async fn process(
         .increment_progress(already_downloaded_size)
         .await;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<LocalManifestFileEntry>(64);
+    get_remote_files(&args.output, files_to_update, main_updater).await?;
 
-    let work = tokio::spawn(async move {
-        let mut hash_new_local_manifest = HashSet::new();
-        let mut new_local_manifest = LocalManifest {
-            version: LOCAL_MANIFEST_VERSION,
-            updater: local_manifest.updater,
-            ..Default::default()
-        };
+    let mut new_local_manifest = LocalManifest {
+        version: LOCAL_MANIFEST_VERSION,
+        updater: local_manifest.updater,
+        ..Default::default()
+    };
 
-        while let Some(manifest) = rx.recv().await {
-            hash_new_local_manifest.insert(PathBuf::from(&manifest.path));
-            new_local_manifest.files.push(manifest);
-        }
-
-        (hash_new_local_manifest, new_local_manifest)
-    });
-
-    let clone_tasks =
-        get_remote_files(&args.output, files_to_update, main_updater, shutdown_rx, tx).await?;
-
-    futures::future::join_all(clone_tasks).await;
-    let (hash_new_local_manifest, mut new_local_manifest) = work.await?;
-
-    for (path, local_entry) in current_local_filedata {
-        if !hash_new_local_manifest.contains(&path) {
-            new_local_manifest.files.push(local_entry);
-        }
+    for file in &remote_manifest.files {
+        new_local_manifest.files.push(LocalManifestFileEntry {
+            path: file.path.clone(),
+            hash: file.source_hash.clone(),
+            size: file.source_size,
+        });
     }
 
     save_local_manifest(&local_manifest_path, &new_local_manifest).await?;

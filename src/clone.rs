@@ -39,7 +39,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use bitar::CloneOutput;
+use bitar::{chunker, CloneOutput};
 use futures::StreamExt;
 use reqwest::Url;
 
@@ -66,6 +66,10 @@ pub async fn estimate_local_chunk_count(
     archive_reader: &RemoteArchiveReader,
     local_file_path: &Path,
 ) -> anyhow::Result<u64> {
+    if !local_file_path.exists() {
+        return Ok(0);
+    }
+
     let chunker_config = archive_reader.chunker_config();
     let chunk_size = match chunker_config {
         bitar::chunker::Config::FixedSize(size) => *size as u64,
@@ -95,6 +99,12 @@ pub async fn build_local_chunk_index<P: Updater>(
     local_file_path: &Path,
     progress: P,
 ) -> anyhow::Result<bitar::ChunkIndex> {
+    if !local_file_path.exists() {
+        return Ok(bitar::ChunkIndex::new_empty(
+            archive_reader.chunk_hash_length(),
+        ));
+    }
+
     let mut local_file = tokio::fs::OpenOptions::new()
         .read(true)
         .open(local_file_path)
@@ -145,6 +155,7 @@ pub async fn init_local_clone_output(
     local_chunk_index: bitar::ChunkIndex,
 ) -> anyhow::Result<CloneOutput<tokio::fs::File>> {
     let local_file = tokio::fs::OpenOptions::new()
+        .create(true)
         .read(true)
         .write(true)
         .truncate(false)
