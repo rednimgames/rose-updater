@@ -39,7 +39,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use bitar::{chunker, CloneOutput};
+use bitar::CloneOutput;
 use futures::StreamExt;
 use reqwest::Url;
 
@@ -51,7 +51,7 @@ const LOCAL_CHUNK_BUFFER_SIZE: usize = 64;
 const REMOTE_CHUNK_BUFFER_SIZE: usize = 64;
 
 /// Initiates a bitar archive reader for reading a remote archive over HTTP
-pub async fn init_remote_archive_reader(url: &Url) -> anyhow::Result<RemoteArchiveReader> {
+pub async fn init_remote_archive_reader(url: Url) -> anyhow::Result<RemoteArchiveReader> {
     let http_reader = bitar::archive_reader::HttpReader::from_url(url.clone()).retries(4);
     let archive = bitar::Archive::try_init(http_reader)
         .await

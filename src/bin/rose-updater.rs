@@ -15,14 +15,13 @@ use fltk_webview::FromFltkWindow;
 use reqwest::Url;
 use tokio::fs;
 use tokio::fs::File;
-use tracing::{debug, error, info, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use rose_update::{
     build_local_chunk_index, clone_remote, clone_remote_file, estimate_local_chunk_count,
     init_local_clone_output, init_remote_archive_reader, launch_button, progress_bar,
-    LocalManifest, LocalManifestFileEntry, RemoteArchiveReader, RemoteManifest,
-    RemoteManifestFileEntry, Updater,
+    LocalManifest, LocalManifestFileEntry, RemoteArchiveReader, RemoteManifest, Updater,
 };
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
@@ -160,19 +159,19 @@ async fn update_updater(
     Ok(())
 }
 
-async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
+async fn get_local_manifest(path: &PathBuf) -> anyhow::Result<LocalManifest> {
     info!("Getting local manifest");
 
     // Read the manifest file if we can. Otherwise we default to an empty local
     // manifest which we save as a new manifest later.
-    let local_manifest = if folder
+    let local_manifest = if path
         .try_exists()
         .context("Failed to get the local manifest")?
     {
-        info!("Using existing manifest file: {}", folder.display());
+        info!(local_manifest_path=%path.display(), "Using existing manifest file");
 
-        let file = File::open(&folder).await?;
-        match serde_json::from_reader(file.into_std().await) {
+        let manifest_file = File::open(&path).await?;
+        match serde_json::from_reader(manifest_file.into_std().await) {
             Ok(manifest) => manifest,
             Err(_) => {
                 info!("Failed to parse local manifest");
@@ -180,80 +179,71 @@ async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
             }
         }
     } else {
+        info!("Creating new manifest");
         LocalManifest::default()
     };
 
     Ok(local_manifest)
 }
 
-struct VerificationResults {
-    files_to_update: Vec<(reqwest::Url, RemoteManifestFileEntry)>,
-    total_size: usize,
-    already_downloaded_size: usize,
+#[derive(Debug)]
+struct FileToDownload {
+    /// Path to file in local directory
+    local_path: String,
+    /// Path to file at remote URL
+    remote_path: String,
 }
 
-fn verify_local_files(
-    output: &Path,
-    remote_url: &Url,
+/// Check which files need to be updated by comparing our local manifest to the remote manifest
+async fn get_files_to_update(
+    output_dir: &Path,
     remote_manifest: &RemoteManifest,
-    local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>,
-    force_verify: bool,
-) -> anyhow::Result<VerificationResults> {
-    info!("Checking local files");
+    local_manifest: &LocalManifest,
+) -> Vec<FileToDownload> {
+    // Build a lookup table to make it easier to check local manifest values
+    let mut local_manifest_data = HashMap::new();
+    for entry in &local_manifest.files {
+        local_manifest_data.insert(&entry.path, entry.clone());
+    }
 
-    let mut files_to_update = Vec::new();
-    let mut total_size = 0;
-    let mut already_downloaded_size = 0;
-    for remote_entry in &remote_manifest.files {
-        let output_path = output.join(&remote_entry.source_path);
-        let needs_update = || {
-            if !output_path.exists() {
-                return true;
-            }
+    // Only return paths in the remote manifest that don't match the local manifest by hash
+    remote_manifest
+        .files
+        .iter()
+        .filter_map(|entry| {
+            let local_path = output_dir.join(&entry.source_path);
 
-            if let Some(local_entry) = local_filedata.get(&PathBuf::from(&remote_entry.source_path))
-            {
-                if local_entry.hash == remote_entry.source_hash {
-                    return false;
+            // Skip updates when the file exists and the hash in the local
+            // manifest matches the remote manifest
+            if local_path.exists() {
+                if let Some(local_entry) = local_manifest_data.get(&entry.source_path) {
+                    if local_entry.hash == entry.source_hash {
+                        return None;
+                    }
                 }
             }
 
-            true
-        };
-
-        total_size += remote_entry.source_size;
-
-        if !force_verify && !needs_update() {
-            debug!(
-                "Skipping file {} as it is already present",
-                output_path.display()
-            );
-            already_downloaded_size += remote_entry.source_size;
-            continue;
-        }
-
-        let clone_url = remote_url.join(&remote_entry.path)?;
-        files_to_update.push((clone_url, remote_entry.clone()));
-    }
-
-    Ok(VerificationResults {
-        files_to_update,
-        total_size,
-        already_downloaded_size,
-    })
+            return Some(FileToDownload {
+                local_path: entry.source_path.clone(),
+                remote_path: entry.path.clone(),
+            });
+        })
+        .collect()
 }
 
 async fn get_remote_files(
+    base_url: &Url,
+    files_to_update: &[FileToDownload],
     output_dir: &Path,
-    files_to_update: Vec<(Url, RemoteManifestFileEntry)>,
     main_updater: MainProgressUpdater,
 ) -> anyhow::Result<()> {
     info!(count = files_to_update.len(), "Starting clone process");
 
     let mut archive_readers = {
         let mut archive_reader_tasks = Vec::new();
-        for (remote_url, _) in &files_to_update {
-            let archive_reader_task = init_remote_archive_reader(remote_url);
+        for file_data in files_to_update {
+            let file_url = base_url.join(&file_data.remote_path)?;
+            let archive_reader_task = init_remote_archive_reader(file_url);
             archive_reader_tasks.push(archive_reader_task);
         }
 
@@ -269,7 +259,7 @@ async fn get_remote_files(
 
     let local_file_paths: Vec<_> = files_to_update
         .iter()
-        .map(|(_, remote_manifest_entry)| output_dir.join(&remote_manifest_entry.source_path))
+        .map(|file_data| output_dir.join(&file_data.local_path))
         .collect();
 
     // Bitar doesn't handle text files well so when one of the text files
@@ -377,18 +367,14 @@ async fn get_remote_files(
     Ok(())
 }
 
-async fn process(
+async fn update_process(
     args: &Args,
     main_updater: MainProgressUpdater,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<DownloadResult> {
+    // Get the base URL for our update remote
     let remote_url =
         Url::parse(&args.url).context(format!("Failed to parse the url {}", args.url))?;
-
-    let remote_manifest = tokio::select! {
-        res = get_remote_manifest(&remote_url, &args.manifest_name) => res?,
-        _ = shutdown_rx.changed() => bail!("Download cancelled")
-    };
 
     // The updater can use different "profiles" to use the same updater for different clients
     let local_manifest_path = args
@@ -397,6 +383,15 @@ async fn process(
         .join(remote_url.host_str().unwrap_or("default"))
         .join("local_manifest.json");
 
+    info!(%remote_url, local_manifest_path=%local_manifest_path.display(), output_dir=%args.output.display(), "Starting update process");
+
+    // Download the remote manifest
+    let remote_manifest = tokio::select! {
+        res = get_remote_manifest(&remote_url, &args.manifest_name) => res?,
+        _ = shutdown_rx.changed() => bail!("Download cancelled")
+    };
+
+    // Load the local manifest (if it exists)
     let local_manifest = tokio::select! {
         res = get_local_manifest(&local_manifest_path) => res?,
         _ = shutdown_rx.changed() => bail!("Download cancelled")
@@ -449,30 +444,10 @@ async fn process(
         return Ok(DownloadResult::UpdaterUpdated);
     }
 
-    // Create a lookup table for our local cache data so we can compare to remote manifest
-    let mut current_local_filedata: HashMap<PathBuf, LocalManifestFileEntry> = HashMap::new();
-    for entry in &local_manifest.files {
-        current_local_filedata.insert(PathBuf::from(&entry.path), entry.clone());
-    }
+    let files_to_update =
+        get_files_to_update(&args.output, &remote_manifest, &local_manifest).await;
 
-    let VerificationResults {
-        files_to_update,
-        total_size,
-        already_downloaded_size,
-    } = verify_local_files(
-        &args.output,
-        &remote_url,
-        &remote_manifest,
-        &current_local_filedata,
-        args.verify,
-    )?;
-
-    main_updater.set_max_progress(total_size).await;
-    main_updater
-        .increment_progress(already_downloaded_size)
-        .await;
-
-    get_remote_files(&args.output, files_to_update, main_updater).await?;
+    get_remote_files(&remote_url, &files_to_update, &args.output, main_updater).await?;
 
     let mut new_local_manifest = LocalManifest {
         version: LOCAL_MANIFEST_VERSION,
@@ -482,7 +457,7 @@ async fn process(
 
     for file in &remote_manifest.files {
         new_local_manifest.files.push(LocalManifestFileEntry {
-            path: file.path.clone(),
+            path: file.source_path.clone(),
             hash: file.source_hash.clone(),
             size: file.source_size,
         });
@@ -637,7 +612,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn a task to download our updates
     let process_future = tokio::spawn(async move {
-        let result = process(&args, main_updater, shutdown_rx).await;
+        let result = update_process(&args, main_updater, shutdown_rx).await;
         if let Ok(download_result) = result {
             info!("Download task completed");
 
