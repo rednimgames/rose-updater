@@ -14,14 +14,14 @@ use fltk::{enums::*, prelude::*, *};
 use fltk_webview::FromFltkWindow;
 use reqwest::Url;
 use tokio::fs;
-use tokio::fs::File;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use rose_update::{
-    build_local_chunk_index, clone_remote, clone_remote_file, estimate_local_chunk_count,
-    init_local_clone_output, init_remote_archive_reader, launch_button, progress_bar,
-    LocalManifest, LocalManifestFileEntry, RemoteArchiveReader, RemoteManifest, Updater,
+    build_local_chunk_index, clone_remote, clone_remote_file, download_remote_manifest,
+    estimate_local_chunk_count, get_or_create_local_manifest, init_local_clone_output,
+    init_remote_archive_reader, launch_button, progress_bar, save_local_manifest, LocalManifest,
+    LocalManifestFileEntry, RemoteArchiveReader, RemoteManifest, Updater,
 };
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
@@ -81,35 +81,9 @@ struct Args {
     exe_args: Vec<String>,
 }
 
-async fn save_local_manifest(manifest_path: &Path, manfiest: &LocalManifest) -> anyhow::Result<()> {
-    if let Some(manifest_parent_dir) = manifest_path.parent() {
-        std::fs::create_dir_all(manifest_parent_dir)?;
-    }
-
-    let manifest_file = std::fs::File::create(manifest_path)?;
-    serde_json::to_writer(manifest_file, &manfiest)?;
-
-    info!("Saved local manifest to {}", manifest_path.display());
-
-    Ok(())
-}
-
 enum DownloadResult {
     ApplicationUpdated,
     UpdaterUpdated,
-}
-
-async fn get_remote_manifest(
-    remote_url: &Url,
-    manifest_name: &str,
-) -> anyhow::Result<RemoteManifest> {
-    info!("Downloading remote manifest");
-    // Download our remote manifest file
-    let remote_manifest_url = remote_url.join(manifest_name)?;
-    Ok(reqwest::get(remote_manifest_url)
-        .await?
-        .json::<RemoteManifest>()
-        .await?)
 }
 
 async fn update_updater(
@@ -157,33 +131,6 @@ async fn update_updater(
     );
 
     Ok(())
-}
-
-async fn get_local_manifest(path: &PathBuf) -> anyhow::Result<LocalManifest> {
-    info!("Getting local manifest");
-
-    // Read the manifest file if we can. Otherwise we default to an empty local
-    // manifest which we save as a new manifest later.
-    let local_manifest = if path
-        .try_exists()
-        .context("Failed to get the local manifest")?
-    {
-        info!(local_manifest_path=%path.display(), "Using existing manifest file");
-
-        let manifest_file = File::open(&path).await?;
-        match serde_json::from_reader(manifest_file.into_std().await) {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                info!("Failed to parse local manifest");
-                LocalManifest::default()
-            }
-        }
-    } else {
-        info!("Creating new manifest");
-        LocalManifest::default()
-    };
-
-    Ok(local_manifest)
 }
 
 #[derive(Debug)]
@@ -387,13 +334,13 @@ async fn update_process(
 
     // Download the remote manifest
     let remote_manifest = tokio::select! {
-        res = get_remote_manifest(&remote_url, &args.manifest_name) => res?,
+        res = download_remote_manifest(&remote_url, &args.manifest_name) => res?,
         _ = shutdown_rx.changed() => bail!("Download cancelled")
     };
 
     // Load the local manifest (if it exists)
     let local_manifest = tokio::select! {
-        res = get_local_manifest(&local_manifest_path) => res?,
+        res = get_or_create_local_manifest(&local_manifest_path) => res?,
         _ = shutdown_rx.changed() => bail!("Download cancelled")
     };
 
