@@ -43,7 +43,7 @@ use bitar::CloneOutput;
 use futures::StreamExt;
 use reqwest::Url;
 
-use crate::Updater;
+use crate::ProgressState;
 
 pub type RemoteArchiveReader = bitar::Archive<bitar::archive_reader::HttpReader>;
 
@@ -94,10 +94,10 @@ pub async fn estimate_local_chunk_count(
 }
 
 /// Build a chunk index for the local file using the chunk configuration from the remote archive
-pub async fn build_local_chunk_index<P: Updater>(
+pub async fn build_local_chunk_index(
     archive_reader: &RemoteArchiveReader,
     local_file_path: &Path,
-    progress: P,
+    progress_state: ProgressState,
 ) -> anyhow::Result<bitar::ChunkIndex> {
     if !local_file_path.exists() {
         return Ok(bitar::ChunkIndex::new_empty(
@@ -137,12 +137,12 @@ pub async fn build_local_chunk_index<P: Updater>(
         chunk_index.add_chunk(hash, chunk.len(), &[chunk_offset]);
 
         if use_incremental_progress {
-            progress.increment_progress(1).await;
+            progress_state.increment_progress(1);
         }
     }
 
     if !use_incremental_progress {
-        progress.increment_progress(1).await;
+        progress_state.increment_progress(1);
     }
 
     Ok(chunk_index)
@@ -174,10 +174,10 @@ pub async fn init_local_clone_output(
 }
 
 /// Clone the remote archive to the local file
-pub async fn clone_remote_file<P: Updater>(
+pub async fn clone_remote_file(
     archive_reader: &mut RemoteArchiveReader,
     clone_output: &mut bitar::CloneOutput<tokio::fs::File>,
-    progress: P,
+    progress_state: ProgressState,
 ) -> anyhow::Result<()> {
     // We only use incremental progress for FixedSize because we can estimate the max size beforehand
     let use_incremental_progress = matches!(
@@ -201,12 +201,12 @@ pub async fn clone_remote_file<P: Updater>(
         clone_output.feed(&verified).await?;
 
         if use_incremental_progress {
-            progress.increment_progress(1).await;
+            progress_state.increment_progress(1);
         }
     }
 
     if !use_incremental_progress {
-        progress.increment_progress(1).await;
+        progress_state.increment_progress(1);
     }
 
     Ok(())

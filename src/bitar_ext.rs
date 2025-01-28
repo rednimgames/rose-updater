@@ -8,19 +8,13 @@ use reqwest::Url;
 use tokio::fs;
 use tracing::instrument;
 
-use async_trait::async_trait;
+use crate::ProgressState;
 
-#[async_trait]
-pub trait Updater {
-    async fn set_max_progress(&self, total: usize);
-    async fn increment_progress(&self, amount: usize);
-}
-
-#[instrument(skip(updater))]
-pub async fn clone_remote<T: Updater>(
+#[instrument(skip(progress_state))]
+pub async fn clone_remote(
     url: &Url,
     output_path: &Path,
-    updater: T,
+    progress_state: ProgressState,
 ) -> anyhow::Result<()> {
     let http_reader = HttpReader::from_url(url.clone()).retries(4);
 
@@ -55,7 +49,7 @@ pub async fn clone_remote<T: Updater>(
             let (offset, verified) = r?;
             let (hash, chunk) = verified.into_parts();
             output_index.add_chunk(hash, chunk.len(), &[offset]);
-            updater.increment_progress(chunk.len()).await;
+            progress_state.increment_progress(chunk.len() as u64);
         }
     }
 
@@ -72,7 +66,7 @@ pub async fn clone_remote<T: Updater>(
         let unverified = compressed.decompress()?;
         let verified = unverified.verify()?;
         let size = output.feed(&verified).await?;
-        updater.increment_progress(size).await;
+        progress_state.increment_progress(size as u64);
     }
 
     Ok(())

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context};
-use async_trait::async_trait;
 use bitar::{ChunkIndex, CloneOutput};
 use clap::Parser;
 use fltk::frame::Frame;
@@ -21,7 +20,7 @@ use rose_update::{
     build_local_chunk_index, clone_remote, clone_remote_file, download_remote_manifest,
     estimate_local_chunk_count, get_or_create_local_manifest, init_local_clone_output,
     init_remote_archive_reader, launch_button, progress_bar, save_local_manifest, LocalManifest,
-    LocalManifestFileEntry, RemoteArchiveReader, RemoteManifest, Updater,
+    LocalManifestFileEntry, ProgressState, RemoteArchiveReader, RemoteManifest,
 };
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
@@ -90,7 +89,7 @@ async fn update_updater(
     local_updater_path: &Path,
     updater_output_path: &Path,
     remote_url: &Url,
-    main_updater: MainProgressUpdater,
+    progress_state: ProgressState,
 ) -> anyhow::Result<()> {
     // When the updater needs to be updated we change the exe name before
     // restarting the process. This step ensures that we delete the old,
@@ -120,7 +119,7 @@ async fn update_updater(
             ))?;
     }
 
-    clone_remote(remote_url, updater_output_path, main_updater)
+    clone_remote(remote_url, updater_output_path, progress_state)
         .await
         .context(format!("Failed to clone {}", &remote_url))?;
 
@@ -182,7 +181,7 @@ async fn get_remote_files(
     base_url: &Url,
     files_to_update: &[FileToDownload],
     output_dir: &Path,
-    main_updater: MainProgressUpdater,
+    progress_state: ProgressState,
 ) -> anyhow::Result<()> {
     info!(count = files_to_update.len(), "Starting clone process");
 
@@ -237,16 +236,14 @@ async fn get_remote_files(
         "Building local chunk indexes"
     );
 
-    main_updater
-        .set_max_progress(total_local_chunk_count as usize)
-        .await;
+    progress_state.set_max_progress(total_local_chunk_count);
 
     let chunk_indexes = {
         let chunk_index_tasks: Vec<_> = archive_readers
             .iter()
             .zip(&local_file_paths)
             .map(|(archive_reader, local_file_path)| {
-                build_local_chunk_index(archive_reader, &local_file_path, main_updater.clone())
+                build_local_chunk_index(archive_reader, &local_file_path, progress_state.clone())
             })
             .collect();
 
@@ -291,16 +288,14 @@ async fn get_remote_files(
         "Downloading missing chunks"
     );
 
-    main_updater
-        .set_max_progress(total_download_chunk_count as usize)
-        .await;
+    progress_state.set_max_progress(total_download_chunk_count as u64);
 
     {
         let clone_tasks = archive_readers
             .iter_mut()
             .zip(clone_outputs.iter_mut())
             .map(|(archive_reader, clone_output)| {
-                clone_remote_file(archive_reader, clone_output, main_updater.clone())
+                clone_remote_file(archive_reader, clone_output, progress_state.clone())
             });
 
         let clone_results: anyhow::Result<Vec<()>> = futures::future::join_all(clone_tasks)
@@ -316,7 +311,7 @@ async fn get_remote_files(
 
 async fn update_process(
     args: &Args,
-    main_updater: MainProgressUpdater,
+    progress_state: ProgressState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<DownloadResult> {
     // Get the base URL for our update remote
@@ -353,14 +348,12 @@ async fn update_process(
     if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
-        main_updater
-            .set_max_progress(remote_manifest.updater.source_size)
-            .await;
+        progress_state.set_max_progress(remote_manifest.updater.source_size as u64);
 
         let remote = remote_url.join(&remote_manifest.updater.path)?;
 
         tokio::select! {
-            res = update_updater(&local_updater_path, &updater_output_path, &remote, main_updater) => res?,
+            res = update_updater(&local_updater_path, &updater_output_path, &remote, progress_state) => res?,
             _ = shutdown_rx.changed() => bail!("Download cancelled")
         }
 
@@ -394,7 +387,7 @@ async fn update_process(
     let files_to_update =
         get_files_to_update(&args.output, &remote_manifest, &local_manifest).await;
 
-    get_remote_files(&remote_url, &files_to_update, &args.output, main_updater).await?;
+    get_remote_files(&remote_url, &files_to_update, &args.output, progress_state).await?;
 
     let mut new_local_manifest = LocalManifest {
         version: LOCAL_MANIFEST_VERSION,
@@ -416,37 +409,10 @@ async fn update_process(
 }
 
 #[derive(Debug)]
-enum MainProgressUpdaterEvent {
-    SetMaxProgress(usize),
-    IncrementProgress(usize),
-}
-
-#[derive(Debug)]
 enum Message {
-    MainProgressUpdate(MainProgressUpdaterEvent),
     Launch,
     Shutdown,
     Error(String),
-}
-
-#[derive(Clone)]
-struct MainProgressUpdater {
-    sender: app::Sender<Message>,
-}
-
-#[async_trait]
-impl Updater for MainProgressUpdater {
-    async fn set_max_progress(&self, total: usize) {
-        self.sender.send(Message::MainProgressUpdate(
-            MainProgressUpdaterEvent::SetMaxProgress(total),
-        ));
-    }
-
-    async fn increment_progress(&self, amount: usize) {
-        self.sender.send(Message::MainProgressUpdate(
-            MainProgressUpdaterEvent::IncrementProgress(amount),
-        ));
-    }
 }
 
 #[tokio::main]
@@ -524,13 +490,13 @@ async fn main() -> anyhow::Result<()> {
     webview.navigate("https://roseonlinegame.com/launcher.html");
 
     // general channel
-    let (tx, rx) = app::channel::<Message>();
+    let (app_message_sender, app_message_receiver) = app::channel::<Message>();
 
     // shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Create our updaters
-    let main_updater = MainProgressUpdater { sender: tx.clone() };
+    let progress_state = ProgressState::default();
 
     // Clone some args before moving args into download task
     let exe = args.exe.clone();
@@ -558,48 +524,35 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn a task to download our updates
+    let progress_state_clone = progress_state.clone();
     let process_future = tokio::spawn(async move {
-        let result = update_process(&args, main_updater, shutdown_rx).await;
+        let result = update_process(&args, progress_state_clone, shutdown_rx).await;
         if let Ok(download_result) = result {
             info!("Download task completed");
 
             match download_result {
                 DownloadResult::ApplicationUpdated => {
                     info!("Application updated");
-                    tx.send(Message::Launch);
+                    app_message_sender.send(Message::Launch);
                 }
                 DownloadResult::UpdaterUpdated => {
                     // The updater itself was updated, we should exit because a new
                     // process was started with the new updater to update the
                     // application.
                     info!("Updater updated");
-                    tx.send(Message::Shutdown);
+                    app_message_sender.send(Message::Shutdown);
                 }
             }
         } else {
             let error_string = result.err().unwrap().to_string();
             error!("Download task failed or cancelled, error {}", &error_string);
-            tx.send(Message::Error(error_string));
+            app_message_sender.send(Message::Error(error_string));
         }
     });
 
     while app.wait() {
-        if let Some(e) = rx.recv() {
+        if let Some(e) = app_message_receiver.recv() {
             match e {
-                Message::MainProgressUpdate(e) => match e {
-                    MainProgressUpdaterEvent::SetMaxProgress(amount) => {
-                        main_progress_bar.set_minimum(0);
-                        main_progress_bar.set_maximum(amount);
-                        main_progress_bar.set_value(0);
-                        background_frame.redraw();
-                        main_progress_bar.redraw();
-                        launch_button.redraw();
-                    }
-                    MainProgressUpdaterEvent::IncrementProgress(amount) => {
-                        main_progress_bar.set_value(main_progress_bar.value() + amount);
-                        main_progress_bar.redraw();
-                    }
-                },
                 Message::Launch => {
                     info!("Ready to launch");
                     launch_button.activate();
@@ -623,7 +576,30 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        let max_progress = progress_state.max_progress() as usize;
+        if main_progress_bar.maximum() != max_progress {
+            main_progress_bar.set_maximum(max_progress);
+            main_progress_bar.set_value(0);
+
+            // To reset the progress bar area we need to redraw the background
+            // and then draw the progress bar on top of it
+            background_frame.redraw();
+            main_progress_bar.redraw();
+
+            // We need to redraw the button ontop of the background frame after
+            // we've redrawn it
+            launch_button.redraw();
+        }
+
+        let current_progress = progress_state.current_progress() as usize;
+        if main_progress_bar.value() != current_progress {
+            main_progress_bar.set_value(current_progress);
+            main_progress_bar.redraw();
+        }
     }
+
+    // TODO: This will make the updater continue behind the scenes even if the download is in progress, we need to remove this but then fix some other issues
 
     shutdown_tx.send(true)?;
     process_future.await?;
