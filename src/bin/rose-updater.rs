@@ -4,7 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use bitar::{ChunkIndex, CloneOutput};
 use clap::Parser;
 use fltk::frame::Frame;
@@ -227,8 +227,8 @@ async fn get_remote_files(
 
     let mut total_local_chunk_count = 0;
     for (archive_reader, local_file_path) in archive_readers.iter().zip(&local_file_paths) {
-        total_local_chunk_count +=
-            estimate_local_chunk_count(archive_reader, &local_file_path).await?;
+        let chunk_count = estimate_local_chunk_count(archive_reader, &local_file_path).await?;
+        total_local_chunk_count += chunk_count;
     }
 
     info!(
@@ -312,7 +312,6 @@ async fn get_remote_files(
 async fn update_process(
     args: &Args,
     progress_state: ProgressState,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<DownloadResult> {
     // Get the base URL for our update remote
     let remote_url =
@@ -328,16 +327,10 @@ async fn update_process(
     info!(%remote_url, local_manifest_path=%local_manifest_path.display(), output_dir=%args.output.display(), "Starting update process");
 
     // Download the remote manifest
-    let remote_manifest = tokio::select! {
-        res = download_remote_manifest(&remote_url, &args.manifest_name) => res?,
-        _ = shutdown_rx.changed() => bail!("Download cancelled")
-    };
+    let remote_manifest = download_remote_manifest(&remote_url, &args.manifest_name).await?;
 
     // Load the local manifest (if it exists)
-    let local_manifest = tokio::select! {
-        res = get_or_create_local_manifest(&local_manifest_path) => res?,
-        _ = shutdown_rx.changed() => bail!("Download cancelled")
-    };
+    let local_manifest = get_or_create_local_manifest(&local_manifest_path).await?;
 
     // First, we check if the updater itself needs an update. If it does then we
     // will only update the updater then start the process again to update the
@@ -352,10 +345,13 @@ async fn update_process(
 
         let remote = remote_url.join(&remote_manifest.updater.path)?;
 
-        tokio::select! {
-            res = update_updater(&local_updater_path, &updater_output_path, &remote, progress_state) => res?,
-            _ = shutdown_rx.changed() => bail!("Download cancelled")
-        }
+        update_updater(
+            &local_updater_path,
+            &updater_output_path,
+            &remote,
+            progress_state,
+        )
+        .await?;
 
         // We update the local manifest with only the data for the updater, the
         // rest of the data should be updated the next time we run the updater.
@@ -524,31 +520,39 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn a task to download our updates
-    let progress_state_clone = progress_state.clone();
-    let process_future = tokio::spawn(async move {
-        let result = update_process(&args, progress_state_clone, shutdown_rx).await;
-        if let Ok(download_result) = result {
-            info!("Download task completed");
+    let _ = {
+        let progress_state = progress_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
 
-            match download_result {
-                DownloadResult::ApplicationUpdated => {
-                    info!("Application updated");
-                    app_message_sender.send(Message::Launch);
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                res = update_process(&args, progress_state) => res,
+                _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Download cancelled"))
+            };
+
+            if let Ok(download_result) = result {
+                info!("Download task completed");
+
+                match download_result {
+                    DownloadResult::ApplicationUpdated => {
+                        info!("Application updated");
+                        app_message_sender.send(Message::Launch);
+                    }
+                    DownloadResult::UpdaterUpdated => {
+                        // The updater itself was updated, we should exit because a new
+                        // process was started with the new updater to update the
+                        // application.
+                        info!("Updater updated");
+                        app_message_sender.send(Message::Shutdown);
+                    }
                 }
-                DownloadResult::UpdaterUpdated => {
-                    // The updater itself was updated, we should exit because a new
-                    // process was started with the new updater to update the
-                    // application.
-                    info!("Updater updated");
-                    app_message_sender.send(Message::Shutdown);
-                }
+            } else {
+                let error_string = result.err().unwrap().to_string();
+                error!("Download task failed or cancelled, error {}", &error_string);
+                app_message_sender.send(Message::Error(error_string));
             }
-        } else {
-            let error_string = result.err().unwrap().to_string();
-            error!("Download task failed or cancelled, error {}", &error_string);
-            app_message_sender.send(Message::Error(error_string));
-        }
-    });
+        })
+    };
 
     while app.wait() {
         if let Some(e) = app_message_receiver.recv() {
@@ -599,10 +603,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // TODO: This will make the updater continue behind the scenes even if the download is in progress, we need to remove this but then fix some other issues
-
     shutdown_tx.send(true)?;
-    process_future.await?;
 
     Ok(())
 }

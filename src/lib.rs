@@ -9,3 +9,5 @@ pub use bitar_ext::*;
 pub use clone::*;
 pub use manifest::*;
 pub use progress::*;
+
+pub const CHUNK_SIZE_BYTES: usize = 1_000_000;

@@ -8,7 +8,7 @@ use tokio::fs;
 use tokio::fs::File;
 use walkdir::WalkDir;
 
-use rose_update::{RemoteManifest, RemoteManifestFileEntry};
+use rose_update::{RemoteManifest, RemoteManifestFileEntry, CHUNK_SIZE_BYTES};
 
 const REMOTE_MANIFEST_VERSION: usize = 1;
 
@@ -56,7 +56,7 @@ struct Args {
     compression_level: u32,
 
     /// Chunk size in bytes
-    #[clap(long, default_value = "1000000")]
+    #[clap(long, default_value_t = CHUNK_SIZE_BYTES)]
     chunk_size: usize,
 
     /// Relative path to the updater program in the input directory
