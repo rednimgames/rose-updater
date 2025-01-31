@@ -1,11 +1,11 @@
 #![windows_subsystem = "windows"]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process;
 
-use anyhow::{bail, Context};
-use async_trait::async_trait;
+use anyhow::Context;
+use bitar::{ChunkIndex, CloneOutput};
 use clap::Parser;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
@@ -13,17 +13,17 @@ use fltk::{enums::*, prelude::*, *};
 use fltk_webview::FromFltkWindow;
 use reqwest::Url;
 use tokio::fs;
-use tokio::fs::File;
-use tracing::{debug, error, info, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use rose_update::{
-    clone_remote, launch_button, progress_bar, LocalManifest, LocalManifestFileEntry,
-    RemoteManifest, RemoteManifestFileEntry, Updater,
+    build_local_chunk_index, clone_remote_file, download_remote_manifest,
+    estimate_local_chunk_count, get_or_create_local_manifest, init_local_clone_output,
+    init_remote_archive_reader, launch_button, progress_bar, save_local_manifest, LocalManifest,
+    LocalManifestFileEntry, ProgressStage, ProgressState, RemoteArchiveReader, RemoteManifest,
 };
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
-const UPDATER_OLD_EXT: &str = "old";
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 
@@ -66,6 +66,10 @@ struct Args {
     #[clap(long, default_value = "trose.exe")]
     exe: PathBuf,
 
+    /// Working directory to run the executable
+    #[clap(long, default_value = ".")]
+    exe_dir: PathBuf,
+
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
     #[clap(
@@ -73,80 +77,69 @@ struct Args {
         value_delimiter = ' '
     )]
     exe_args: Vec<String>,
-
-    /// Working directory to run the executable
-    #[clap(long, default_value = ".")]
-    exe_dir: PathBuf,
 }
 
-async fn save_local_manifest(manifest_path: &Path, manfiest: &LocalManifest) -> anyhow::Result<()> {
-    if let Some(manifest_parent_dir) = manifest_path.parent() {
-        std::fs::create_dir_all(manifest_parent_dir)?;
-    }
-
-    let manifest_file = std::fs::File::create(manifest_path)?;
-    serde_json::to_writer(manifest_file, &manfiest)?;
-
-    info!("Saved local manifest to {}", manifest_path.display());
-
-    Ok(())
-}
-
-enum DownloadResult {
+enum UpdateProcessResult {
     ApplicationUpdated,
     UpdaterUpdated,
-}
-
-async fn get_remote_manifest(
-    remote_url: &Url,
-    manifest_name: &str,
-) -> anyhow::Result<RemoteManifest> {
-    info!("Downloading remote manifest");
-    // Download our remote manifest file
-    let remote_manifest_url = remote_url.join(manifest_name)?;
-    Ok(reqwest::get(remote_manifest_url)
-        .await?
-        .json::<RemoteManifest>()
-        .await?)
 }
 
 async fn update_updater(
     local_updater_path: &Path,
     updater_output_path: &Path,
     remote_url: &Url,
-    main_updater: MainProgressUpdater,
+    progress_state: ProgressState,
 ) -> anyhow::Result<()> {
-    // When the updater needs to be updated we change the exe name before
-    // restarting the process. This step ensures that we delete the old,
-    // outdated updater exe.
-    let local_updater_path_old = local_updater_path.with_extension(UPDATER_OLD_EXT);
-    if local_updater_path_old.exists() {
-        fs::remove_file(&local_updater_path_old)
-            .await
-            .context(format!(
-                "Failed to delete the old updater file: {}",
-                local_updater_path_old.display()
-            ))?;
-    }
-
     info!("Updating updater");
+
+    let old_updater_temp_path = local_updater_path.with_extension("old");
+    let new_updater_temp_path = local_updater_path.with_extension("new");
+
+    let mut archive_reader = init_remote_archive_reader(remote_url.clone()).await?;
+    let mut clone_output = init_local_clone_output(
+        &archive_reader,
+        &new_updater_temp_path,
+        ChunkIndex::new_empty(archive_reader.chunk_hash_length()),
+    )
+    .await?;
+
+    clone_remote_file(&mut archive_reader, &mut clone_output, progress_state).await?;
 
     // We cannot delete or modify a currently executing binary so we rename
     // the currently executing updater to allow us to download the new one
     // with the same name.
+
+    if old_updater_temp_path.exists() {
+        fs::remove_file(&old_updater_temp_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to delete old updater at {}",
+                    old_updater_temp_path.display()
+                )
+            })?;
+    }
+
     if local_updater_path.exists() {
-        fs::rename(&local_updater_path, &local_updater_path_old)
+        fs::rename(&local_updater_path, &old_updater_temp_path)
             .await
             .context(format!(
                 "Failed to rename the updater from {} to {}",
                 local_updater_path.display(),
-                local_updater_path_old.display(),
+                old_updater_temp_path.display(),
             ))?;
     }
 
-    clone_remote(remote_url, updater_output_path, main_updater)
-        .await
-        .context(format!("Failed to clone {}", &remote_url))?;
+    // Rename the new updater from its temp path to the real path
+    if new_updater_temp_path.exists() {
+        fs::rename(&new_updater_temp_path, &local_updater_path)
+            .await
+            .context(format!(
+                "Failed to rename the updater from {} to {}",
+                new_updater_temp_path.display(),
+                local_updater_path.display(),
+            ))?;
+    }
 
     info!(
         "Cloned {} to {}",
@@ -157,167 +150,203 @@ async fn update_updater(
     Ok(())
 }
 
-async fn get_local_manifest(folder: &PathBuf) -> anyhow::Result<LocalManifest> {
-    info!("Getting local manifest");
-
-    // Read the manifest file if we can. Otherwise we default to an empty local
-    // manifest which we save as a new manifest later.
-    let local_manifest = if folder
-        .try_exists()
-        .context("Failed to get the local manifest")?
-    {
-        info!("Using existing manifest file: {}", folder.display());
-
-        let file = File::open(&folder).await?;
-        match serde_json::from_reader(file.into_std().await) {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                info!("Failed to parse local manifest");
-                LocalManifest::default()
-            }
-        }
-    } else {
-        LocalManifest::default()
-    };
-
-    Ok(local_manifest)
+#[derive(Debug)]
+struct FileToDownload {
+    /// Path to file in local directory
+    local_path: String,
+    /// Path to file at remote URL
+    remote_path: String,
 }
 
-struct VerificationResults {
-    files_to_update: Vec<(reqwest::Url, RemoteManifestFileEntry)>,
-    total_size: usize,
-    already_downloaded_size: usize,
-}
+/// Check which files need to be updated by comparing our local manifest to the remote manifest
+async fn get_files_to_update(
+    output_dir: &Path,
+    remote_manifest: &RemoteManifest,
+    local_manifest: &LocalManifest,
+) -> Vec<FileToDownload> {
+    // Build a lookup table to make it easier to check local manifest values
+    let mut local_manifest_data = HashMap::new();
+    for entry in &local_manifest.files {
+        local_manifest_data.insert(&entry.path, entry.clone());
+    }
 
-fn verify_local_files(
-    output: &Path,
-    remote_url: &Url,
-    remote_manifest: RemoteManifest,
-    local_filedata: &HashMap<PathBuf, LocalManifestFileEntry>,
-    force_verify: bool,
-) -> anyhow::Result<VerificationResults> {
-    info!("Checking local files");
+    // Only return paths in the remote manifest that don't match the local manifest by hash
+    remote_manifest
+        .files
+        .iter()
+        .filter_map(|entry| {
+            let local_path = output_dir.join(&entry.source_path);
 
-    let mut files_to_update = Vec::new();
-    let mut total_size = 0;
-    let mut already_downloaded_size = 0;
-    for remote_entry in remote_manifest.files {
-        let output_path = output.join(&remote_entry.source_path);
-        let needs_update = || {
-            if !output_path.exists() {
-                return true;
-            }
-
-            if let Some(local_entry) = local_filedata.get(&PathBuf::from(&remote_entry.source_path))
-            {
-                if local_entry.hash == remote_entry.source_hash {
-                    return false;
+            // Skip updates when the file exists and the hash in the local
+            // manifest matches the remote manifest
+            if let Some(local_entry) = local_manifest_data.get(&entry.source_path) {
+                if local_entry.hash == entry.source_hash && local_path.exists() {
+                    return None;
                 }
             }
 
-            true
-        };
-
-        total_size += remote_entry.source_size;
-
-        if !force_verify && !needs_update() {
-            debug!(
-                "Skipping file {} as it is already present",
-                output_path.display()
-            );
-            already_downloaded_size += remote_entry.source_size;
-            continue;
-        }
-
-        let clone_url = remote_url.join(&remote_entry.path)?;
-        files_to_update.push((clone_url, remote_entry));
-    }
-
-    Ok(VerificationResults {
-        files_to_update,
-        total_size,
-        already_downloaded_size,
-    })
+            return Some(FileToDownload {
+                local_path: entry.source_path.clone(),
+                remote_path: entry.path.clone(),
+            });
+        })
+        .collect()
 }
 
-fn get_remote_files(
-    output: &Path,
-    files_to_update: Vec<(Url, RemoteManifestFileEntry)>,
-    main_updater: MainProgressUpdater,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    tx: tokio::sync::mpsc::Sender<LocalManifestFileEntry>,
-) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
-    let mut clone_tasks = Vec::new();
+async fn get_remote_files(
+    base_url: &Url,
+    files_to_update: &[FileToDownload],
+    output_dir: &Path,
+    progress_state: ProgressState,
+) -> anyhow::Result<()> {
+    info!(count = files_to_update.len(), "Starting clone process");
 
-    for entry in files_to_update {
-        let (clone_url, remote_entry) = entry;
-        let main_updater = main_updater.clone();
-        let output_path = output.join(&remote_entry.source_path);
-        let mut cloned_shutdown = shutdown_rx.clone();
-        let cloned_tx = tx.clone();
+    let mut archive_readers = {
+        let mut archive_reader_tasks = Vec::new();
+        for file_data in files_to_update {
+            let file_url = base_url.join(&file_data.remote_path)?;
+            let archive_reader_task = init_remote_archive_reader(file_url);
+            archive_reader_tasks.push(archive_reader_task);
+        }
 
-        // Bitar doesn't handle text files well so when one of the text files
-        // has changed, we delete it first so bitar will just redownload the
-        // whole file.
-        if let Some(ext) = output_path.extension().and_then(|s| s.to_str()) {
+        let archive_readers: anyhow::Result<Vec<RemoteArchiveReader>> =
+            futures::future::join_all(archive_reader_tasks)
+                .await
+                .into_iter()
+                .collect();
+        archive_readers?
+    };
+
+    info!(count = archive_readers.len(), "Remote Archives Initialized");
+
+    let local_file_paths: Vec<_> = files_to_update
+        .iter()
+        .map(|file_data| output_dir.join(&file_data.local_path))
+        .collect();
+
+    // Bitar doesn't handle text files well so when one of the text files
+    // has changed, we delete it first so bitar will just redownload the
+    // whole file.
+    for path in &local_file_paths {
+        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             if TEXT_FILE_EXTENSIONS.contains(&ext) {
-                if let Err(e) = std::fs::remove_file(&output_path) {
+                if let Err(e) = std::fs::remove_file(&path) {
                     error!(
-                        path =? output_path.display(),
+                        path =? path.display(),
                         error =? e,
                         "Failed to delete text file"
                     )
                 }
             }
         }
-
-        clone_tasks.push(tokio::spawn(async move {
-            info!("Downloading {}", &clone_url);
-            tokio::select! {
-                res = clone_remote(
-                    &clone_url,
-                    &output_path,
-                    main_updater) => {
-                        match res {
-                            Ok(_) => {
-                                info!("Cloned {} to {}", clone_url, output_path.display());
-                                let clone_message = LocalManifestFileEntry {
-                                    path: remote_entry.source_path.clone(),
-                                    hash: remote_entry.source_hash.clone(),
-                                    size: remote_entry.source_size,
-                                };
-
-                                if let Err(err) = cloned_tx.send(clone_message).await {
-                                    error!("Failed to send clone message: {}", err);
-                                }
-                            }
-                            Err(err) => {
-                                error!("Failed to clone {}: {}", clone_url, err);
-                            }
-                        }
-                    },
-                _ = cloned_shutdown.changed() => {
-                    info!("Stopped cloning {}", &clone_url);
-                }
-            }
-        }));
     }
 
-    Ok(clone_tasks)
+    let mut total_local_chunk_count = 0;
+    for (archive_reader, local_file_path) in archive_readers.iter().zip(&local_file_paths) {
+        let chunk_count = estimate_local_chunk_count(archive_reader, &local_file_path).await?;
+        total_local_chunk_count += chunk_count;
+    }
+
+    info!(
+        chunk_count = total_local_chunk_count,
+        "Building local chunk indexes"
+    );
+
+    progress_state.set_stage(ProgressStage::CheckingFiles);
+    progress_state.set_current_progress(0);
+    progress_state.set_max_progress(total_local_chunk_count);
+
+    let chunk_indexes = {
+        let chunk_index_tasks: Vec<_> = archive_readers
+            .iter()
+            .zip(&local_file_paths)
+            .map(|(archive_reader, local_file_path)| {
+                build_local_chunk_index(archive_reader, &local_file_path, progress_state.clone())
+            })
+            .collect();
+
+        let chunk_indexes: anyhow::Result<Vec<ChunkIndex>> =
+            futures::future::join_all(chunk_index_tasks)
+                .await
+                .into_iter()
+                .collect();
+
+        chunk_indexes?
+    };
+
+    info!(
+        clone_output_count = archive_readers.len(),
+        "Initializing clone outputs"
+    );
+
+    let mut clone_outputs = {
+        let clone_output_tasks = archive_readers
+            .iter()
+            .zip(&local_file_paths)
+            .zip(chunk_indexes)
+            .map(|((archive_reader, local_file_path), local_chunk_index)| {
+                init_local_clone_output(archive_reader, local_file_path, local_chunk_index)
+            });
+
+        let clone_outputs: anyhow::Result<Vec<CloneOutput<tokio::fs::File>>> =
+            futures::future::join_all(clone_output_tasks)
+                .await
+                .into_iter()
+                .collect();
+
+        clone_outputs?
+    };
+
+    let mut total_download_chunk_count = 0;
+    let mut total_download_chunk_size = 0;
+
+    for clone_output in &clone_outputs {
+        for (_hashsum, chunk_location) in clone_output.chunks().iter_chunks() {
+            total_download_chunk_count += 1;
+            total_download_chunk_size += chunk_location.size();
+        }
+    }
+
+    info!(
+        chunk_count = total_download_chunk_count,
+        chunks_total_size = total_download_chunk_size,
+        "Downloading missing chunks"
+    );
+
+    progress_state.set_stage(ProgressStage::DownloadingUpdates);
+    progress_state.set_current_progress(0);
+    progress_state.set_max_progress(total_download_chunk_size as u64);
+
+    {
+        let clone_tasks = archive_readers
+            .iter_mut()
+            .zip(clone_outputs.iter_mut())
+            .map(|(archive_reader, clone_output)| {
+                clone_remote_file(archive_reader, clone_output, progress_state.clone())
+            });
+
+        let clone_results: anyhow::Result<Vec<()>> = futures::future::join_all(clone_tasks)
+            .await
+            .into_iter()
+            .collect();
+
+        clone_results?;
+    }
+
+    // TODO: Verify files??
+
+    Ok(())
 }
 
-async fn process(
+async fn update_process(
     args: &Args,
-    main_updater: MainProgressUpdater,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<DownloadResult> {
+    progress_state: ProgressState,
+) -> anyhow::Result<UpdateProcessResult> {
+    progress_state.set_stage(ProgressStage::FetchingMetadata);
+
+    // Get the base URL for our update remote
     let remote_url =
         Url::parse(&args.url).context(format!("Failed to parse the url {}", args.url))?;
-
-    let remote_manifest = tokio::select! {
-        res = get_remote_manifest(&remote_url, &args.manifest_name) => res?,
-        _ = shutdown_rx.changed() => bail!("Download cancelled")
-    };
 
     // The updater can use different "profiles" to use the same updater for different clients
     let local_manifest_path = args
@@ -326,10 +355,13 @@ async fn process(
         .join(remote_url.host_str().unwrap_or("default"))
         .join("local_manifest.json");
 
-    let local_manifest = tokio::select! {
-        res = get_local_manifest(&local_manifest_path) => res?,
-        _ = shutdown_rx.changed() => bail!("Download cancelled")
-    };
+    info!(%remote_url, local_manifest_path=%local_manifest_path.display(), output_dir=%args.output.display(), "Starting update process");
+
+    // Download the remote manifest
+    let remote_manifest = download_remote_manifest(&remote_url, &args.manifest_name).await?;
+
+    // Load the local manifest (if it exists)
+    let local_manifest = get_or_create_local_manifest(&local_manifest_path).await?;
 
     // First, we check if the updater itself needs an update. If it does then we
     // will only update the updater then start the process again to update the
@@ -340,16 +372,19 @@ async fn process(
     if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
-        main_updater
-            .set_max_progress(remote_manifest.updater.source_size)
-            .await;
-
         let remote = remote_url.join(&remote_manifest.updater.path)?;
 
-        tokio::select! {
-            res = update_updater(&local_updater_path, &updater_output_path, &remote, main_updater) => res?,
-            _ = shutdown_rx.changed() => bail!("Download cancelled")
-        }
+        progress_state.set_stage(ProgressStage::UpdatingUpdater);
+        progress_state.set_current_progress(0);
+        progress_state.set_max_progress(remote_manifest.updater.source_size as u64);
+
+        update_updater(
+            &local_updater_path,
+            &updater_output_path,
+            &remote,
+            progress_state,
+        )
+        .await?;
 
         // We update the local manifest with only the data for the updater, the
         // rest of the data should be updated the next time we run the updater.
@@ -366,108 +401,51 @@ async fn process(
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
         info!("Restarting updater");
-        Command::new(env::current_exe()?)
+        process::Command::new(env::current_exe()?)
             .args(
                 env::args()
                     .skip(1)
                     // Prevent infinite loop of update rechecks by removing the forced updater check
                     .filter(|arg| !arg.contains("force-recheck-updater")),
             )
+            // Don't share handles so child process can exit cleanly
+            .stdin(process::Stdio::null())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
             .spawn()?;
 
-        return Ok(DownloadResult::UpdaterUpdated);
+        return Ok(UpdateProcessResult::UpdaterUpdated);
     }
 
-    // Create a lookup table for our local cache data so we can compare to remote manifest
-    let mut current_local_filedata: HashMap<PathBuf, LocalManifestFileEntry> = HashMap::new();
-    for entry in &local_manifest.files {
-        current_local_filedata.insert(PathBuf::from(&entry.path), entry.clone());
-    }
+    let files_to_update =
+        get_files_to_update(&args.output, &remote_manifest, &local_manifest).await;
 
-    let VerificationResults {
-        files_to_update,
-        total_size,
-        already_downloaded_size,
-    } = verify_local_files(
-        &args.output,
-        &remote_url,
-        remote_manifest,
-        &current_local_filedata,
-        args.verify,
-    )?;
+    get_remote_files(&remote_url, &files_to_update, &args.output, progress_state).await?;
 
-    main_updater.set_max_progress(total_size).await;
-    main_updater
-        .increment_progress(already_downloaded_size)
-        .await;
+    let mut new_local_manifest = LocalManifest {
+        version: LOCAL_MANIFEST_VERSION,
+        updater: local_manifest.updater,
+        ..Default::default()
+    };
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<LocalManifestFileEntry>(64);
-
-    let work = tokio::spawn(async move {
-        let mut hash_new_local_manifest = HashSet::new();
-        let mut new_local_manifest = LocalManifest {
-            version: LOCAL_MANIFEST_VERSION,
-            updater: local_manifest.updater,
-            ..Default::default()
-        };
-
-        while let Some(manifest) = rx.recv().await {
-            hash_new_local_manifest.insert(PathBuf::from(&manifest.path));
-            new_local_manifest.files.push(manifest);
-        }
-
-        (hash_new_local_manifest, new_local_manifest)
-    });
-
-    let clone_tasks =
-        get_remote_files(&args.output, files_to_update, main_updater, shutdown_rx, tx)?;
-
-    futures::future::join_all(clone_tasks).await;
-    let (hash_new_local_manifest, mut new_local_manifest) = work.await?;
-
-    for (path, local_entry) in current_local_filedata {
-        if !hash_new_local_manifest.contains(&path) {
-            new_local_manifest.files.push(local_entry);
-        }
+    for file in &remote_manifest.files {
+        new_local_manifest.files.push(LocalManifestFileEntry {
+            path: file.source_path.clone(),
+            hash: file.source_hash.clone(),
+            size: file.source_size,
+        });
     }
 
     save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-    Ok(DownloadResult::ApplicationUpdated)
-}
-
-#[derive(Debug)]
-enum MainProgressUpdaterEvent {
-    SetMaxProgress(usize),
-    IncrementProgress(usize),
+    Ok(UpdateProcessResult::ApplicationUpdated)
 }
 
 #[derive(Debug)]
 enum Message {
-    MainProgressUpdate(MainProgressUpdaterEvent),
     Launch,
     Shutdown,
     Error(String),
-}
-
-#[derive(Clone)]
-struct MainProgressUpdater {
-    sender: app::Sender<Message>,
-}
-
-#[async_trait]
-impl Updater for MainProgressUpdater {
-    async fn set_max_progress(&self, total: usize) {
-        self.sender.send(Message::MainProgressUpdate(
-            MainProgressUpdaterEvent::SetMaxProgress(total),
-        ));
-    }
-
-    async fn increment_progress(&self, amount: usize) {
-        self.sender.send(Message::MainProgressUpdate(
-            MainProgressUpdaterEvent::IncrementProgress(amount),
-        ));
-    }
 }
 
 #[tokio::main]
@@ -545,13 +523,13 @@ async fn main() -> anyhow::Result<()> {
     webview.navigate("https://roseonlinegame.com/launcher.html");
 
     // general channel
-    let (tx, rx) = app::channel::<Message>();
+    let (app_message_sender, app_message_receiver) = app::channel::<Message>();
 
     // shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Create our updaters
-    let main_updater = MainProgressUpdater { sender: tx.clone() };
+    let progress_state = ProgressState::default();
 
     // Clone some args before moving args into download task
     let exe = args.exe.clone();
@@ -569,9 +547,13 @@ async fn main() -> anyhow::Result<()> {
 
         let exe = exe_dir.join(&exe);
 
-        Command::new(&exe)
+        process::Command::new(&exe)
             .current_dir(&exe_dir)
             .args(&exe_args)
+            // Don't share handles so child process can exit cleanly
+            .stdin(process::Stdio::null())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
             .spawn()
             .unwrap();
 
@@ -579,53 +561,50 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn a task to download our updates
-    let process_future = tokio::spawn(async move {
-        let result = process(&args, main_updater, shutdown_rx).await;
-        if let Ok(download_result) = result {
-            info!("Download task completed");
+    let _ = {
+        let progress_state = progress_state.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
 
-            match download_result {
-                DownloadResult::ApplicationUpdated => {
-                    info!("Application updated");
-                    tx.send(Message::Launch);
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                res = update_process(&args, progress_state) => res,
+                _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Download cancelled"))
+            };
+
+            if let Ok(download_result) = result {
+                info!("Download task completed");
+
+                match download_result {
+                    UpdateProcessResult::ApplicationUpdated => {
+                        info!("Application updated");
+                        app_message_sender.send(Message::Launch);
+                    }
+                    UpdateProcessResult::UpdaterUpdated => {
+                        // The updater itself was updated, we should exit because a new
+                        // process was started with the new updater to update the
+                        // application.
+                        info!("Updater updated");
+                        app_message_sender.send(Message::Shutdown);
+                        app::awake();
+                    }
                 }
-                DownloadResult::UpdaterUpdated => {
-                    // The updater itself was updated, we should exit because a new
-                    // process was started with the new updater to update the
-                    // application.
-                    info!("Updater updated");
-                    tx.send(Message::Shutdown);
-                }
+            } else {
+                let error_string = result.err().unwrap().to_string();
+                error!("Download task failed or cancelled, error {}", &error_string);
+                app_message_sender.send(Message::Error(error_string));
             }
-        } else {
-            let error_string = result.err().unwrap().to_string();
-            error!("Download task failed or cancelled, error {}", &error_string);
-            tx.send(Message::Error(error_string));
-        }
-    });
+        })
+    };
 
     while app.wait() {
-        if let Some(e) = rx.recv() {
+        if let Some(e) = app_message_receiver.recv() {
             match e {
-                Message::MainProgressUpdate(e) => match e {
-                    MainProgressUpdaterEvent::SetMaxProgress(amount) => {
-                        main_progress_bar.set_minimum(0);
-                        main_progress_bar.set_maximum(amount);
-                        main_progress_bar.set_value(0);
-                        background_frame.redraw();
-                        main_progress_bar.redraw();
-                        launch_button.redraw();
-                    }
-                    MainProgressUpdaterEvent::IncrementProgress(amount) => {
-                        main_progress_bar.set_value(main_progress_bar.value() + amount);
-                        main_progress_bar.redraw();
-                    }
-                },
                 Message::Launch => {
                     info!("Ready to launch");
                     launch_button.activate();
                     launch_button.change_state(launch_button::LaunchButtonState::Play);
                     launch_button.redraw();
+                    progress_state.set_stage(ProgressStage::Play);
                 }
                 Message::Shutdown => {
                     info!("Shutting down");
@@ -644,10 +623,37 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        let max_progress = progress_state.max_progress() as usize;
+        if main_progress_bar.maximum() != max_progress {
+            main_progress_bar.set_maximum(max_progress);
+            main_progress_bar.set_value(0);
+
+            // To reset the progress bar area we need to redraw the background
+            // and then draw the progress bar on top of it
+            background_frame.redraw();
+            main_progress_bar.redraw();
+
+            // We need to redraw the button ontop of the background frame after
+            // we've redrawn it
+            launch_button.redraw();
+        }
+
+        let current_progress = progress_state.current_progress() as usize;
+        if main_progress_bar.value() != current_progress {
+            main_progress_bar.set_value(current_progress);
+            main_progress_bar.redraw();
+        }
+
+        let current_stage = progress_state.current_stage();
+        if main_progress_bar.current_stage() != current_stage {
+            main_progress_bar.set_stage(current_stage);
+            main_progress_bar.redraw();
+        }
     }
 
+    info!("Sending shutdown signal");
     shutdown_tx.send(true)?;
-    process_future.await?;
-
+    info!("Terminating application");
     Ok(())
 }
