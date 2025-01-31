@@ -1,4 +1,4 @@
-//#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -255,8 +255,6 @@ async fn get_remote_files(
     progress_state.set_stage(ProgressStage::CheckingFiles);
     progress_state.set_current_progress(0);
     progress_state.set_max_progress(total_local_chunk_count);
-
-    tokio::time::sleep(std::time::Duration::from_secs(900)).await;
 
     let chunk_indexes = {
         let chunk_index_tasks: Vec<_> = archive_readers
@@ -549,7 +547,7 @@ async fn main() -> anyhow::Result<()> {
 
         let exe = exe_dir.join(&exe);
 
-        Command::new(&exe)
+        process::Command::new(&exe)
             .current_dir(&exe_dir)
             .args(&exe_args)
             // Don't share handles so child process can exit cleanly
