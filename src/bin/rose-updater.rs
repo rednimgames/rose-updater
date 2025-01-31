@@ -368,7 +368,7 @@ async fn update_process(
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
         info!("Restarting updater");
-        Command::new(env::current_exe()?)
+        let mut cmd = Command::new(env::current_exe()?)
             .args(
                 env::args()
                     .skip(1)
@@ -376,6 +376,8 @@ async fn update_process(
                     .filter(|arg| !arg.contains("force-recheck-updater")),
             )
             .spawn()?;
+
+        let _ = cmd.wait();
 
         return Ok(DownloadResult::UpdaterUpdated);
     }
