@@ -1,5 +1,5 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use fltk::enums::{Align, Color, Font, FrameType};
@@ -8,13 +8,15 @@ use fltk::image::*;
 use fltk::{draw, prelude::*};
 use humansize::{format_size, DECIMAL};
 
+use crate::ProgressStage;
+
 pub struct ProgressBar {
     bar: Frame,
     min: Arc<AtomicUsize>,
     max: Arc<AtomicUsize>,
     value: Arc<AtomicUsize>,
     _max_size: Arc<AtomicI32>,
-    is_zero: Arc<AtomicBool>,
+    stage: Arc<AtomicU64>,
 }
 
 impl ProgressBar {
@@ -22,30 +24,35 @@ impl ProgressBar {
         let progress_bar_bytes = include_bytes!("../res/Launcher_Alpha_LoadingBar.png");
         let font_bytes = include_bytes!("../res/JosefinSans-Bold.ttf");
         let black_bytes = include_bytes!("../res/ariblk.ttf");
+
         #[allow(invalid_from_utf8_unchecked)]
         unsafe {
             Font::set_font(Font::Helvetica, std::str::from_utf8_unchecked(font_bytes));
             Font::set_font(Font::Courier, std::str::from_utf8_unchecked(black_bytes));
         }
+
         let mut bar = Frame::new(x, y, 546, 56 + 30, "");
         let min = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));
         let value = Arc::new(AtomicUsize::new(0));
         let max_size = Arc::new(AtomicI32::new(0));
-        let is_zero = Arc::new(AtomicBool::new(false));
+        let stage = Arc::new(AtomicU64::new(ProgressStage::None as u64));
+
         bar.draw({
             let min = min.clone();
             let max = max.clone();
             let value = value.clone();
             let max_size = max_size.clone();
-            let is_zero = is_zero.clone();
+            let stage = stage.clone();
+
             move |b| {
                 let mut png = PngImage::from_data(progress_bar_bytes).unwrap();
 
                 let value = value.load(Ordering::Relaxed);
                 let max = max.load(Ordering::Relaxed);
                 let min = min.load(Ordering::Relaxed);
-                let is_zero = is_zero.load(Ordering::Relaxed);
+                let is_zero = max == 0;
+                let stage = ProgressStage::from(stage.load(Ordering::Relaxed) as usize);
 
                 let value = if value > max { max } else { value };
 
@@ -90,20 +97,30 @@ impl ProgressBar {
                     );
                 }
 
-                // underneath total size
-                let data_size = format!(
-                    "{} / {}",
-                    format_size(value, DECIMAL),
-                    format_size(max, DECIMAL)
-                );
-                let data_size = if is_zero {
-                    "- B / - B".to_string()
-                } else {
-                    data_size
+                let message = match stage {
+                    ProgressStage::FetchingMetadata => "Fetching metadata".into(),
+                    ProgressStage::UpdatingUpdater => {
+                        format!(
+                            "Updating updater - {} / {}",
+                            format_size(value, DECIMAL),
+                            format_size(max, DECIMAL)
+                        )
+                    }
+                    ProgressStage::CheckingFiles => {
+                        format!("Checking local files - {} / {}", value, max)
+                    }
+                    ProgressStage::DownloadingUpdates => {
+                        format!(
+                            "Downloading Updates - {} / {}",
+                            format_size(value, DECIMAL),
+                            format_size(max, DECIMAL)
+                        )
+                    }
+                    _ => "".into(),
                 };
 
                 draw::set_font(Font::Helvetica, 12);
-                let mut size = draw::width(&data_size) as i32;
+                let mut size = draw::width(&message) as i32;
                 if size > max_size.load(Ordering::Relaxed) {
                     max_size.store(size, Ordering::Relaxed);
                 } else {
@@ -120,7 +137,7 @@ impl ProgressBar {
                 draw::set_font(Font::Helvetica, 12);
                 draw::set_draw_color(Color::White);
                 draw::draw_text2(
-                    &data_size,
+                    &message,
                     b.x(),
                     b.y() + b.height() - 30,
                     b.width(),
@@ -129,13 +146,14 @@ impl ProgressBar {
                 );
             }
         });
+
         Self {
             bar,
             min,
             max,
             value,
             _max_size: max_size,
-            is_zero,
+            stage,
         }
     }
 
@@ -145,9 +163,6 @@ impl ProgressBar {
 
     pub fn set_maximum(&mut self, value: usize) {
         self.max.store(value, Ordering::Relaxed);
-        if value == 0 {
-            self.is_zero.store(true, Ordering::Relaxed);
-        }
     }
 
     pub fn set_value(&mut self, value: usize) {
@@ -164,6 +179,14 @@ impl ProgressBar {
 
     pub fn value(&self) -> usize {
         self.value.load(Ordering::Relaxed)
+    }
+
+    pub fn current_stage(&self) -> ProgressStage {
+        ProgressStage::from(self.stage.load(Ordering::Relaxed) as usize)
+    }
+
+    pub fn set_stage(&mut self, value: ProgressStage) {
+        self.stage.store(value as u64, Ordering::Relaxed);
     }
 }
 

@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process;
 
 use anyhow::Context;
 use bitar::{ChunkIndex, CloneOutput};
@@ -17,14 +17,13 @@ use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use rose_update::{
-    build_local_chunk_index, clone_remote, clone_remote_file, download_remote_manifest,
+    build_local_chunk_index, clone_remote_file, download_remote_manifest,
     estimate_local_chunk_count, get_or_create_local_manifest, init_local_clone_output,
     init_remote_archive_reader, launch_button, progress_bar, save_local_manifest, LocalManifest,
-    LocalManifestFileEntry, ProgressState, RemoteArchiveReader, RemoteManifest,
+    LocalManifestFileEntry, ProgressStage, ProgressState, RemoteArchiveReader, RemoteManifest,
 };
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
-const UPDATER_OLD_EXT: &str = "old";
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 
@@ -80,7 +79,7 @@ struct Args {
     exe_args: Vec<String>,
 }
 
-enum DownloadResult {
+enum UpdateProcessResult {
     ApplicationUpdated,
     UpdaterUpdated,
 }
@@ -91,37 +90,56 @@ async fn update_updater(
     remote_url: &Url,
     progress_state: ProgressState,
 ) -> anyhow::Result<()> {
-    // When the updater needs to be updated we change the exe name before
-    // restarting the process. This step ensures that we delete the old,
-    // outdated updater exe.
-    let local_updater_path_old = local_updater_path.with_extension(UPDATER_OLD_EXT);
-    if local_updater_path_old.exists() {
-        fs::remove_file(&local_updater_path_old)
-            .await
-            .context(format!(
-                "Failed to delete the old updater file: {}",
-                local_updater_path_old.display()
-            ))?;
-    }
-
     info!("Updating updater");
+
+    let old_updater_temp_path = local_updater_path.with_extension("old");
+    let new_updater_temp_path = local_updater_path.with_extension("new");
+
+    let mut archive_reader = init_remote_archive_reader(remote_url.clone()).await?;
+    let mut clone_output = init_local_clone_output(
+        &archive_reader,
+        &new_updater_temp_path,
+        ChunkIndex::new_empty(archive_reader.chunk_hash_length()),
+    )
+    .await?;
+
+    clone_remote_file(&mut archive_reader, &mut clone_output, progress_state).await?;
 
     // We cannot delete or modify a currently executing binary so we rename
     // the currently executing updater to allow us to download the new one
     // with the same name.
+
+    if old_updater_temp_path.exists() {
+        fs::remove_file(&old_updater_temp_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to delete old updater at {}",
+                    old_updater_temp_path.display()
+                )
+            })?;
+    }
+
     if local_updater_path.exists() {
-        fs::rename(&local_updater_path, &local_updater_path_old)
+        fs::rename(&local_updater_path, &old_updater_temp_path)
             .await
             .context(format!(
                 "Failed to rename the updater from {} to {}",
                 local_updater_path.display(),
-                local_updater_path_old.display(),
+                old_updater_temp_path.display(),
             ))?;
     }
 
-    clone_remote(remote_url, updater_output_path, progress_state)
-        .await
-        .context(format!("Failed to clone {}", &remote_url))?;
+    // Rename the new updater from its temp path to the real path
+    if new_updater_temp_path.exists() {
+        fs::rename(&new_updater_temp_path, &local_updater_path)
+            .await
+            .context(format!(
+                "Failed to rename the updater from {} to {}",
+                new_updater_temp_path.display(),
+                local_updater_path.display(),
+            ))?;
+    }
 
     info!(
         "Cloned {} to {}",
@@ -161,11 +179,9 @@ async fn get_files_to_update(
 
             // Skip updates when the file exists and the hash in the local
             // manifest matches the remote manifest
-            if local_path.exists() {
-                if let Some(local_entry) = local_manifest_data.get(&entry.source_path) {
-                    if local_entry.hash == entry.source_hash {
-                        return None;
-                    }
+            if let Some(local_entry) = local_manifest_data.get(&entry.source_path) {
+                if local_entry.hash == entry.source_hash && local_path.exists() {
+                    return None;
                 }
             }
 
@@ -236,7 +252,11 @@ async fn get_remote_files(
         "Building local chunk indexes"
     );
 
+    progress_state.set_stage(ProgressStage::CheckingFiles);
+    progress_state.set_current_progress(0);
     progress_state.set_max_progress(total_local_chunk_count);
+
+    tokio::time::sleep(std::time::Duration::from_secs(900)).await;
 
     let chunk_indexes = {
         let chunk_index_tasks: Vec<_> = archive_readers
@@ -279,16 +299,25 @@ async fn get_remote_files(
         clone_outputs?
     };
 
-    let total_download_chunk_count = clone_outputs
-        .iter()
-        .fold(0, |acc, clone_output| acc + clone_output.chunks().len());
+    let mut total_download_chunk_count = 0;
+    let mut total_download_chunk_size = 0;
+
+    for clone_output in &clone_outputs {
+        for (_hashsum, chunk_location) in clone_output.chunks().iter_chunks() {
+            total_download_chunk_count += 1;
+            total_download_chunk_size += chunk_location.size();
+        }
+    }
 
     info!(
         chunk_count = total_download_chunk_count,
+        chunks_total_size = total_download_chunk_size,
         "Downloading missing chunks"
     );
 
-    progress_state.set_max_progress(total_download_chunk_count as u64);
+    progress_state.set_stage(ProgressStage::DownloadingUpdates);
+    progress_state.set_current_progress(0);
+    progress_state.set_max_progress(total_download_chunk_size as u64);
 
     {
         let clone_tasks = archive_readers
@@ -306,13 +335,17 @@ async fn get_remote_files(
         clone_results?;
     }
 
+    // TODO: Verify files??
+
     Ok(())
 }
 
 async fn update_process(
     args: &Args,
     progress_state: ProgressState,
-) -> anyhow::Result<DownloadResult> {
+) -> anyhow::Result<UpdateProcessResult> {
+    progress_state.set_stage(ProgressStage::FetchingMetadata);
+
     // Get the base URL for our update remote
     let remote_url =
         Url::parse(&args.url).context(format!("Failed to parse the url {}", args.url))?;
@@ -341,9 +374,11 @@ async fn update_process(
     if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
-        progress_state.set_max_progress(remote_manifest.updater.source_size as u64);
-
         let remote = remote_url.join(&remote_manifest.updater.path)?;
+
+        progress_state.set_stage(ProgressStage::UpdatingUpdater);
+        progress_state.set_current_progress(0);
+        progress_state.set_max_progress(remote_manifest.updater.source_size as u64);
 
         update_updater(
             &local_updater_path,
@@ -368,18 +403,20 @@ async fn update_process(
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
         info!("Restarting updater");
-        let mut cmd = Command::new(env::current_exe()?)
+        process::Command::new(env::current_exe()?)
             .args(
                 env::args()
                     .skip(1)
                     // Prevent infinite loop of update rechecks by removing the forced updater check
                     .filter(|arg| !arg.contains("force-recheck-updater")),
             )
+            // Don't share handles so child process can exit cleanly
+            .stdin(process::Stdio::null())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
             .spawn()?;
 
-        let _ = cmd.wait();
-
-        return Ok(DownloadResult::UpdaterUpdated);
+        return Ok(UpdateProcessResult::UpdaterUpdated);
     }
 
     let files_to_update =
@@ -403,7 +440,7 @@ async fn update_process(
 
     save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-    Ok(DownloadResult::ApplicationUpdated)
+    Ok(UpdateProcessResult::ApplicationUpdated)
 }
 
 #[derive(Debug)]
@@ -515,6 +552,10 @@ async fn main() -> anyhow::Result<()> {
         Command::new(&exe)
             .current_dir(&exe_dir)
             .args(&exe_args)
+            // Don't share handles so child process can exit cleanly
+            .stdin(process::Stdio::null())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null())
             .spawn()
             .unwrap();
 
@@ -536,16 +577,17 @@ async fn main() -> anyhow::Result<()> {
                 info!("Download task completed");
 
                 match download_result {
-                    DownloadResult::ApplicationUpdated => {
+                    UpdateProcessResult::ApplicationUpdated => {
                         info!("Application updated");
                         app_message_sender.send(Message::Launch);
                     }
-                    DownloadResult::UpdaterUpdated => {
+                    UpdateProcessResult::UpdaterUpdated => {
                         // The updater itself was updated, we should exit because a new
                         // process was started with the new updater to update the
                         // application.
                         info!("Updater updated");
                         app_message_sender.send(Message::Shutdown);
+                        app::awake();
                     }
                 }
             } else {
@@ -564,6 +606,7 @@ async fn main() -> anyhow::Result<()> {
                     launch_button.activate();
                     launch_button.change_state(launch_button::LaunchButtonState::Play);
                     launch_button.redraw();
+                    progress_state.set_stage(ProgressStage::Play);
                 }
                 Message::Shutdown => {
                     info!("Shutting down");
@@ -603,9 +646,16 @@ async fn main() -> anyhow::Result<()> {
             main_progress_bar.set_value(current_progress);
             main_progress_bar.redraw();
         }
+
+        let current_stage = progress_state.current_stage();
+        if main_progress_bar.current_stage() != current_stage {
+            main_progress_bar.set_stage(current_stage);
+            main_progress_bar.redraw();
+        }
     }
 
+    info!("Sending shutdown signal");
     shutdown_tx.send(true)?;
-
+    info!("Terminating application");
     Ok(())
 }

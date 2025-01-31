@@ -198,10 +198,15 @@ pub async fn clone_remote_file(
 
     while let Some(r) = chunk_stream.next().await {
         let verified = r??;
-        clone_output.feed(&verified).await?;
+        let bytes_written = clone_output.feed(&verified).await?;
 
-        if use_incremental_progress {
-            progress_state.increment_progress(1);
+        // When "feeding" verified chunks to the clone output, some chunks may
+        // already exist in the target location and the result will be 0 bytes
+        // written. In such cases, progress reporting is skipped since no actual
+        // data transfer occurred.
+
+        if use_incremental_progress && bytes_written > 0 {
+            progress_state.increment_progress(verified.len() as u64);
         }
     }
 
