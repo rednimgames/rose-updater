@@ -99,6 +99,10 @@ struct Args {
     #[clap(long, default_value = ".")]
     exe_dir: PathBuf,
 
+    /// When update is complete and we are able to launch the game, auto launch it
+    #[clap(long)]
+    auto_launch: bool,
+
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
     #[clap(
@@ -210,7 +214,7 @@ impl UpdaterApp {
             news_state,
             ui_state,
             update_process_handle: None,
-            use_beta: true,
+            use_beta: false,
         };
 
         app.run_news_process();
@@ -314,9 +318,10 @@ impl UpdaterApp {
         } else {
             self.args.exe_dir.join(&self.args.exe)
         };
+
         Command::new(exe_path)
             .current_dir(&self.args.exe_dir)
-            .args(&self.args.exe_args)
+            .args(&exe_args)
             .spawn()?;
 
         Ok(())
@@ -498,7 +503,7 @@ impl eframe::App for UpdaterApp {
             });
         });
 
-        if self.ui_state.launch_game {
+        if self.ui_state.launch_game || (self.ui_state.enable_play_button && self.args.auto_launch) {
             if let Err(e) = self.launch_game() {
                 self.ui_state.content_view = ContentAreaView::Error(UpdaterError::CommandError(e));
             } else {
@@ -887,7 +892,7 @@ async fn update_process(args: &Args, progress_state: Arc<ProgressState>) -> anyh
             &updater_output_path,
             reqwest::Client::builder().build()?,
         )
-        .await?;
+            .await?;
 
         let total_local_chunks_size = downloader.output_original_size();
         let total_download_chunk_count = downloader.chunk_download_count();
@@ -1241,7 +1246,7 @@ fn main() -> anyhow::Result<()> {
             Box::new(app)
         }),
     )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     Ok(())
 }
