@@ -42,6 +42,7 @@ use anyhow::Context;
 use bitar::CloneOutput;
 use futures::StreamExt;
 use reqwest::Url;
+use tokio::fs;
 
 use crate::progress::ProgressState;
 
@@ -154,6 +155,14 @@ pub async fn init_local_clone_output(
     local_file_path: &Path,
     local_chunk_index: bitar::ChunkIndex,
 ) -> anyhow::Result<CloneOutput<tokio::fs::File>> {
+    if let Some(parent) = local_file_path.parent() {
+        fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "Failed to create directory to clone into: {}",
+                parent.display()
+            )
+        })?;
+    }
     let local_file = tokio::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -163,7 +172,7 @@ pub async fn init_local_clone_output(
         .await
         .with_context(|| {
             format!(
-                "Failed to open the local file for reading at {}",
+                "Failed to open the local file for cloning at {}",
                 local_file_path.display()
             )
         })?;

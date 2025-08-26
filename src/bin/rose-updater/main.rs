@@ -1,4 +1,5 @@
 #![windows_subsystem = "windows"]
+
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::process;
 use anyhow::Context;
 use bitar::{ChunkIndex, CloneOutput};
 use clap::Parser;
+use directories::ProjectDirs;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
@@ -15,7 +17,8 @@ use reqwest::Url;
 use rose_update::progress::{ProgressStage, ProgressState};
 use tokio::fs;
 use tracing::{error, info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{FmtSubscriber, Layer};
 
 use rose_update::clone::{
     build_local_chunk_index, clone_remote_file, estimate_local_chunk_count,
@@ -38,7 +41,7 @@ const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 #[clap(about, version, author)]
 struct Args {
     /// Remote archive URL
-    #[clap(long, default_value = "https://updates.roseonlinegame.com")]
+    #[clap(long, default_value = "https://updates2.roseonlinegame.com")]
     url: String,
 
     /// Output directory
@@ -235,16 +238,24 @@ async fn get_remote_files(
     // has changed, we delete it first so bitar will just redownload the
     // whole file.
     for path in &local_file_paths {
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if TEXT_FILE_EXTENSIONS.contains(&ext) {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    error!(
-                        path =? path.display(),
-                        error =? e,
-                        "Failed to delete text file"
-                    )
-                }
-            }
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+
+        if !TEXT_FILE_EXTENSIONS.contains(&ext) {
+            continue;
+        }
+
+        if !path.exists() {
+            continue;
+        }
+
+        if let Err(e) = std::fs::remove_file(&path) {
+            error!(
+                path =? path.display(),
+                error =? e,
+                "Failed to delete text file"
+            )
         }
     }
 
@@ -350,6 +361,10 @@ async fn update_process(
     progress_state: ProgressState,
 ) -> anyhow::Result<UpdateProcessResult> {
     progress_state.set_stage(ProgressStage::FetchingMetadata);
+
+    fs::create_dir_all(&args.output)
+        .await
+        .context("Failed to create output directory")?;
 
     // Get the base URL for our update remote
     let remote_url =
@@ -460,11 +475,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Setup tracing for logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Critical failure: Failed to set default tracing subscriber");
+    let _log_guard = setup_logging(Level::INFO)?;
 
     // Load application resources
     let icon_bytes = include_bytes!("../../../res/client.png");
@@ -489,10 +500,10 @@ async fn main() -> anyhow::Result<()> {
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
     launch_button.deactivate();
 
-    // let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
-    // webview_win.set_border(false);
-    // webview_win.set_frame(FrameType::NoBox);
-    // webview_win.make_resizable(false);
+    let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
+    webview_win.set_border(false);
+    webview_win.set_frame(FrameType::NoBox);
+    webview_win.make_resizable(false);
 
     let icon = image::PngImage::from_data(icon_bytes)?;
     win.set_icon(Some(icon));
@@ -663,4 +674,48 @@ async fn main() -> anyhow::Result<()> {
     shutdown_tx.send(true)?;
     info!("Terminating application");
     Ok(())
+}
+
+fn setup_logging(
+    level: tracing::Level,
+) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
+    let Some(project_dirs) = ProjectDirs::from("com", "Rednim Games", "ROSE Online") else {
+        anyhow::bail!("Failed to get project dirs");
+    };
+
+    let log_file_path = project_dirs.data_local_dir().join("rose-updater.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_file_path)?;
+
+    let env_filter = format!("{},hyper=info,mio=info", level);
+    let (non_blocking_file_appender, log_guard) = tracing_appender::non_blocking(log_file);
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .pretty()
+        .with_filter(tracing_subscriber::EnvFilter::new(&env_filter));
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .pretty()
+        .with_ansi(false)
+        .with_line_number(false)
+        .with_file(false)
+        .with_target(false)
+        .with_writer(move || non_blocking_file_appender.clone())
+        .with_filter(tracing_subscriber::EnvFilter::new(&env_filter));
+
+    let subscriber = tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(file_layer);
+
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set default subscriber");
+
+    Ok(log_guard)
 }
