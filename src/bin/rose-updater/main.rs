@@ -18,7 +18,7 @@ use rose_update::progress::{ProgressStage, ProgressState};
 use tokio::fs;
 use tracing::{error, info, Level};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::{FmtSubscriber, Layer};
+use tracing_subscriber::Layer;
 
 use rose_update::clone::{
     build_local_chunk_index, clone_remote_file, estimate_local_chunk_count,

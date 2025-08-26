@@ -41,10 +41,10 @@ use std::path::Path;
 use anyhow::Context;
 use bitar::CloneOutput;
 use futures::StreamExt;
-use reqwest::Url;
+
 use tokio::fs;
 
-use crate::progress::ProgressState;
+use crate::{dns::CloudflareResolver, progress::ProgressState};
 
 pub type RemoteArchiveReader = bitar::Archive<bitar::archive_reader::HttpReader>;
 
@@ -52,8 +52,15 @@ const LOCAL_CHUNK_BUFFER_SIZE: usize = 64;
 const REMOTE_CHUNK_BUFFER_SIZE: usize = 64;
 
 /// Initiates a bitar archive reader for reading a remote archive over HTTP
-pub async fn init_remote_archive_reader(url: Url) -> anyhow::Result<RemoteArchiveReader> {
-    let http_reader = bitar::archive_reader::HttpReader::from_url(url.clone()).retries(4);
+pub async fn init_remote_archive_reader(url: reqwest::Url) -> anyhow::Result<RemoteArchiveReader> {
+    let client = reqwest::ClientBuilder::new()
+        .brotli(true)
+        .dns_resolver2(CloudflareResolver::new())
+        .build()
+        .context("Failed to build request client")?
+        .get(url.clone());
+
+    let http_reader = bitar::archive_reader::HttpReader::from_request(client).retries(4);
     let archive = bitar::Archive::try_init(http_reader)
         .await
         .with_context(|| format!("Failed to read remote archive at {}", &url))?;

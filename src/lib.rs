@@ -1,4 +1,5 @@
 pub mod clone;
+pub mod dns;
 pub mod manifest;
 pub mod progress;
 
