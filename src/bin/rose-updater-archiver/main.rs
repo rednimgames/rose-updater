@@ -8,7 +8,8 @@ use tokio::fs;
 use tokio::fs::File;
 use walkdir::WalkDir;
 
-use rose_update::{RemoteManifest, RemoteManifestFileEntry, CHUNK_SIZE_BYTES};
+use rose_update::manifest::{RemoteManifest, RemoteManifestFileEntry};
+use rose_update::CHUNK_SIZE_BYTES;
 
 const REMOTE_MANIFEST_VERSION: usize = 1;
 

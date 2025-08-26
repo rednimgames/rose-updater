@@ -19,9 +19,11 @@ pub struct LaunchButton {
 
 impl LaunchButton {
     pub fn new(x: i32, y: i32) -> Self {
-        let update_state = include_bytes!("../res/Launcher_Alpha_UpdateButton.png") as &[u8];
-        let updating_state = include_bytes!("../res/Launcher_Alpha_UpdatingButton.png") as &[u8];
-        let play_state = include_bytes!("../res/Launcher_Alpha_PlayButton.png") as &[u8];
+        let update_state =
+            include_bytes!("../../../res/Launcher_Alpha_UpdateButton.png") as &[u8];
+        let updating_state =
+            include_bytes!("../../../res/Launcher_Alpha_UpdatingButton.png") as &[u8];
+        let play_state = include_bytes!("../../../res/Launcher_Alpha_PlayButton.png") as &[u8];
 
         let mut frm = Frame::new(x, y, 196, 56, "");
         let state = Rc::from(RefCell::from(LaunchButtonState::Updating));

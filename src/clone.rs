@@ -43,7 +43,7 @@ use bitar::CloneOutput;
 use futures::StreamExt;
 use reqwest::Url;
 
-use crate::ProgressState;
+use crate::progress::ProgressState;
 
 pub type RemoteArchiveReader = bitar::Archive<bitar::archive_reader::HttpReader>;
 

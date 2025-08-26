@@ -12,16 +12,23 @@ use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
 use fltk_webview::FromFltkWindow;
 use reqwest::Url;
+use rose_update::progress::{ProgressStage, ProgressState};
 use tokio::fs;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use rose_update::{
-    build_local_chunk_index, clone_remote_file, download_remote_manifest,
-    estimate_local_chunk_count, get_or_create_local_manifest, init_local_clone_output,
-    init_remote_archive_reader, launch_button, progress_bar, save_local_manifest, LocalManifest,
-    LocalManifestFileEntry, ProgressStage, ProgressState, RemoteArchiveReader, RemoteManifest,
+use rose_update::clone::{
+    build_local_chunk_index, clone_remote_file, estimate_local_chunk_count,
+    init_local_clone_output, init_remote_archive_reader, RemoteArchiveReader,
 };
+use rose_update::manifest::{
+    download_remote_manifest, get_or_create_local_manifest, save_local_manifest, LocalManifest,
+    LocalManifestFileEntry, RemoteManifest,
+};
+
+pub mod launch_button;
+// pub mod news;
+pub mod progress_bar;
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
 
@@ -460,8 +467,8 @@ async fn main() -> anyhow::Result<()> {
         .expect("Critical failure: Failed to set default tracing subscriber");
 
     // Load application resources
-    let icon_bytes = include_bytes!("../../res/client.png");
-    let background_bytes = include_bytes!("../../res/Launcher_Alpha_Background.png");
+    let icon_bytes = include_bytes!("../../../res/client.png");
+    let background_bytes = include_bytes!("../../../res/Launcher_Alpha_Background.png");
 
     let mut background_image = PngImage::from_data(background_bytes).unwrap();
 
@@ -482,10 +489,10 @@ async fn main() -> anyhow::Result<()> {
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
     launch_button.deactivate();
 
-    let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
-    webview_win.set_border(false);
-    webview_win.set_frame(FrameType::NoBox);
-    webview_win.make_resizable(false);
+    // let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
+    // webview_win.set_border(false);
+    // webview_win.set_frame(FrameType::NoBox);
+    // webview_win.make_resizable(false);
 
     let icon = image::PngImage::from_data(icon_bytes)?;
     win.set_icon(Some(icon));
