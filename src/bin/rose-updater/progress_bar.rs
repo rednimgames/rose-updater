@@ -21,9 +21,9 @@ pub struct ProgressBar {
 
 impl ProgressBar {
     pub fn new(x: i32, y: i32) -> Self {
-        let progress_bar_bytes = include_bytes!("../res/Launcher_Alpha_LoadingBar.png");
-        let font_bytes = include_bytes!("../res/JosefinSans-Bold.ttf");
-        let black_bytes = include_bytes!("../res/ariblk.ttf");
+        let progress_bar_bytes = include_bytes!("../../../res/Launcher_Alpha_LoadingBar.png");
+        let font_bytes = include_bytes!("../../../res/JosefinSans-Bold.ttf");
+        let black_bytes = include_bytes!("../../../res/ariblk.ttf");
 
         #[allow(invalid_from_utf8_unchecked)]
         unsafe {
