@@ -30,7 +30,6 @@ use rose_update::manifest::{
 };
 
 pub mod launch_button;
-// pub mod news;
 pub mod progress_bar;
 
 const LOCAL_MANIFEST_VERSION: usize = 1;

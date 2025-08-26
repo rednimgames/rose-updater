@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "rose_update"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "bitar",
