@@ -474,7 +474,15 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Setup tracing for logging
-    let _log_guard = setup_logging(Level::INFO)?;
+    let _log_guard = setup_logging(Level::INFO).inspect_err(|e| {
+        eprintln!("Error setting up logging, error: {e}");
+
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("Initialization Error")
+            .set_description(e.to_string())
+            .show();
+    })?;
 
     // Load application resources
     let icon_bytes = include_bytes!("../../../res/client.png");
@@ -683,6 +691,10 @@ fn setup_logging(
     };
 
     let log_file_path = project_dirs.data_local_dir().join("rose-updater.log");
+    if let Some(log_file_dir) = log_file_path.parent() {
+        std::fs::create_dir_all(log_file_dir)?;
+    }
+
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
