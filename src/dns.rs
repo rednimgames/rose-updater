@@ -7,34 +7,61 @@ use hickory_resolver::{
     proto::runtime::TokioRuntimeProvider,
     Resolver,
 };
+use tracing::warn;
+
+type HickoryResolver = Resolver<GenericConnector<TokioRuntimeProvider>>;
 
 pub struct CloudflareResolver {
-    resolver: Arc<Resolver<GenericConnector<TokioRuntimeProvider>>>,
+    cloudflare: Arc<HickoryResolver>,
+    system: Arc<HickoryResolver>,
 }
 
 impl CloudflareResolver {
     pub fn new() -> Self {
-        let resolver = Resolver::builder_with_config(
+        let cloudflare = Resolver::builder_with_config(
             ResolverConfig::cloudflare(),
             TokioConnectionProvider::default(),
         )
         .build();
 
+        let system = Resolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default(),
+        )
+        .build();
+
         Self {
-            resolver: Arc::new(resolver),
+            cloudflare: Arc::new(cloudflare),
+            system: Arc::new(system),
         }
     }
 }
 
 impl reqwest::dns::Resolve for CloudflareResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let resolver = self.resolver.clone();
+        let cloudflare = self.cloudflare.clone();
+        let system = self.system.clone();
         Box::pin(async move {
-            let lookup = resolver.lookup_ip(name.as_str()).await?;
-            let addrs: reqwest::dns::Addrs = Box::new(HickoryAddrs {
-                iter: lookup.into_iter(),
-            });
-            Ok(addrs)
+            match cloudflare.lookup_ip(name.as_str()).await {
+                Ok(lookup) => {
+                    let addrs: reqwest::dns::Addrs = Box::new(HickoryAddrs {
+                        iter: lookup.into_iter(),
+                    });
+                    Ok(addrs)
+                }
+                Err(e) => {
+                    warn!(
+                        "Cloudflare DNS resolution failed for {}, falling back to system DNS: {}",
+                        name.as_str(),
+                        e
+                    );
+                    let lookup = system.lookup_ip(name.as_str()).await?;
+                    let addrs: reqwest::dns::Addrs = Box::new(HickoryAddrs {
+                        iter: lookup.into_iter(),
+                    });
+                    Ok(addrs)
+                }
+            }
         })
     }
 }
