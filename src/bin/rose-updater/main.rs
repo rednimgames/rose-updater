@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
 use anyhow::Context;
 use bitar::{ChunkIndex, CloneOutput};
@@ -202,12 +203,13 @@ async fn get_files_to_update(
         .collect()
 }
 
+/// Downloads/repairs files from remote. Returns the number of files that had chunks downloaded.
 async fn get_remote_files(
     base_url: &Url,
     files_to_update: &[FileToDownload],
     output_dir: &Path,
     progress_state: ProgressState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     info!(count = files_to_update.len(), "Starting clone process");
 
     let mut archive_readers = {
@@ -316,11 +318,17 @@ async fn get_remote_files(
 
     let mut total_download_chunk_count = 0;
     let mut total_download_chunk_size = 0;
+    let mut files_repaired = 0;
 
     for clone_output in &clone_outputs {
+        let mut file_needs_repair = false;
         for (_hashsum, chunk_location) in clone_output.chunks().iter_chunks() {
             total_download_chunk_count += 1;
             total_download_chunk_size += chunk_location.size();
+            file_needs_repair = true;
+        }
+        if file_needs_repair {
+            files_repaired += 1;
         }
     }
 
@@ -350,9 +358,63 @@ async fn get_remote_files(
         clone_results?;
     }
 
-    // TODO: Verify files??
+    Ok(files_repaired)
+}
 
-    Ok(())
+/// Build the full file list from a remote manifest (all files, not just changed ones)
+fn build_full_file_list(remote_manifest: &RemoteManifest) -> Vec<FileToDownload> {
+    remote_manifest
+        .files
+        .iter()
+        .map(|entry| FileToDownload {
+            local_path: entry.source_path.clone(),
+            remote_path: entry.path.clone(),
+        })
+        .collect()
+}
+
+/// Verify all files against the remote manifest and repair any that are corrupted.
+/// Returns the number of files that were repaired.
+async fn verify_and_repair(
+    remote_url: &Url,
+    manifest_name: &str,
+    output_dir: &Path,
+    local_manifest_path: &Path,
+    progress_state: ProgressState,
+) -> anyhow::Result<usize> {
+    progress_state.set_stage(ProgressStage::FetchingMetadata);
+    progress_state.set_current_progress(0);
+    progress_state.set_max_progress(0);
+
+    let remote_manifest = download_remote_manifest(remote_url, manifest_name).await?;
+    let all_files = build_full_file_list(&remote_manifest);
+
+    info!(count = all_files.len(), "Starting verification");
+
+    progress_state.set_stage(ProgressStage::VerifyingFiles);
+
+    let files_repaired =
+        get_remote_files(remote_url, &all_files, output_dir, progress_state).await?;
+
+    // Update local manifest to match remote after verification
+    let local_manifest = get_or_create_local_manifest(local_manifest_path).await?;
+    let mut new_local_manifest = LocalManifest {
+        version: LOCAL_MANIFEST_VERSION,
+        updater: local_manifest.updater,
+        ..Default::default()
+    };
+    for file in &remote_manifest.files {
+        new_local_manifest.files.push(LocalManifestFileEntry {
+            path: file.source_path.clone(),
+            hash: file.source_hash.clone(),
+            size: file.source_size,
+        });
+    }
+    save_local_manifest(local_manifest_path, &new_local_manifest).await?;
+
+    info!(files_repaired, "Verification complete");
+
+    Ok(files_repaired)
 }
 
 async fn update_process(
@@ -438,10 +500,23 @@ async fn update_process(
         return Ok(UpdateProcessResult::UpdaterUpdated);
     }
 
-    let files_to_update =
-        get_files_to_update(&args.output, &remote_manifest, &local_manifest).await;
+    let files_to_update = if args.force_recheck {
+        build_full_file_list(&remote_manifest)
+    } else {
+        get_files_to_update(&args.output, &remote_manifest, &local_manifest).await
+    };
 
-    get_remote_files(&remote_url, &files_to_update, &args.output, progress_state).await?;
+    get_remote_files(&remote_url, &files_to_update, &args.output, progress_state.clone()).await?;
+
+    // Verify all files after update
+    progress_state.set_stage(ProgressStage::VerifyingFiles);
+    let all_files = build_full_file_list(&remote_manifest);
+    let files_repaired =
+        get_remote_files(&remote_url, &all_files, &args.output, progress_state).await?;
+
+    if files_repaired > 0 {
+        info!(files_repaired, "Repaired files during post-update verification");
+    }
 
     let mut new_local_manifest = LocalManifest {
         version: LOCAL_MANIFEST_VERSION,
@@ -467,6 +542,9 @@ enum Message {
     Launch,
     Shutdown,
     Error(String),
+    VerifyStarted,
+    VerifyComplete { repaired: usize },
+    VerifyCancelled,
 }
 
 #[tokio::main]
@@ -506,6 +584,15 @@ async fn main() -> anyhow::Result<()> {
 
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
     launch_button.deactivate();
+
+    // Verify button: small text button under the Play button
+    let mut verify_button = button::Button::new(572, 607, 196, 20, "Verify");
+    verify_button.set_label_size(11);
+    verify_button.set_color(Color::from_rgb(33, 26, 39));
+    verify_button.set_label_color(Color::White);
+    verify_button.set_frame(FrameType::FlatBox);
+    verify_button.deactivate();
+    verify_button.hide();
 
     let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
     webview_win.set_border(false);
@@ -553,6 +640,10 @@ async fn main() -> anyhow::Result<()> {
     // shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // verify cancellation channel
+    let verify_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
     // Create our updaters
     let progress_state = ProgressState::default();
 
@@ -560,6 +651,11 @@ async fn main() -> anyhow::Result<()> {
     let exe = args.exe.clone();
     let exe_dir = args.exe_dir.clone();
     let exe_args = args.exe_args.clone();
+
+    // Store args needed for verify button
+    let verify_url = args.url.clone();
+    let verify_manifest_name = args.manifest_name.clone();
+    let verify_output = args.output.clone();
 
     // When the launch button is clicked we start the application
     launch_button.set_callback(move |_| {
@@ -585,12 +681,151 @@ async fn main() -> anyhow::Result<()> {
         app.quit();
     });
 
-    // Spawn a task to download our updates
+    // Verify button callback
+    {
+        let app_message_sender = app_message_sender.clone();
+        let progress_state = progress_state.clone();
+        let verify_cancel_tx = verify_cancel_tx.clone();
+        let verify_url = verify_url.clone();
+        let verify_manifest_name = verify_manifest_name.clone();
+        let verify_output = verify_output.clone();
+
+        verify_button.set_callback(move |btn| {
+            let cancel_tx = verify_cancel_tx.clone();
+            let is_verifying = btn.label() == "Stop";
+
+            if is_verifying {
+                // Cancel the running verification
+                let cancel_tx = cancel_tx.clone();
+                tokio::spawn(async move {
+                    let guard = cancel_tx.lock().await;
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(true);
+                    }
+                });
+                return;
+            }
+
+            // Start verification
+            btn.set_label("Stop");
+            btn.redraw();
+            app_message_sender.send(Message::VerifyStarted);
+
+            let app_message_sender = app_message_sender.clone();
+            let progress_state = progress_state.clone();
+            let verify_url = verify_url.clone();
+            let verify_manifest_name = verify_manifest_name.clone();
+            let verify_output = verify_output.clone();
+
+            let (cancel_send, mut cancel_recv) = tokio::sync::watch::channel(false);
+            let cancel_tx_clone = cancel_tx.clone();
+            tokio::spawn(async move {
+                // Store the cancel sender so the Stop button can use it
+                {
+                    let mut guard = cancel_tx_clone.lock().await;
+                    *guard = Some(cancel_send);
+                }
+
+                let remote_url = match Url::parse(&verify_url) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        app_message_sender
+                            .send(Message::Error(format!("Failed to parse URL: {}", e)));
+                        return;
+                    }
+                };
+
+                let local_manifest_path = verify_output
+                    .join("updater")
+                    .join(remote_url.host_str().unwrap_or("default"))
+                    .join("local_manifest.json");
+
+                let result = tokio::select! {
+                    res = verify_and_repair(
+                        &remote_url,
+                        &verify_manifest_name,
+                        &verify_output,
+                        &local_manifest_path,
+                        progress_state,
+                    ) => res,
+                    _ = cancel_recv.changed() => {
+                        info!("Verification cancelled by user");
+                        app_message_sender.send(Message::VerifyCancelled);
+                        // Clear the cancel sender
+                        let mut guard = cancel_tx_clone.lock().await;
+                        *guard = None;
+                        return;
+                    }
+                };
+
+                // Clear the cancel sender
+                {
+                    let mut guard = cancel_tx_clone.lock().await;
+                    *guard = None;
+                }
+
+                match result {
+                    Ok(repaired) => {
+                        app_message_sender.send(Message::VerifyComplete { repaired });
+                    }
+                    Err(e) => {
+                        error!("Verification failed: {}", e);
+                        app_message_sender
+                            .send(Message::Error(format!("Verification failed: {}", e)));
+                    }
+                }
+            });
+        });
+    }
+
+    // Spawn a task to download our updates (or verify only if --verify flag is set)
     let _ = {
         let progress_state = progress_state.clone();
         let mut shutdown_rx = shutdown_rx.clone();
+        let verify_only = args.verify;
+        let verify_url_for_task = args.url.clone();
+        let verify_manifest_for_task = args.manifest_name.clone();
+        let verify_output_for_task = args.output.clone();
 
         tokio::spawn(async move {
+            if verify_only {
+                // --verify flag: skip update, go straight to verify+repair
+                let remote_url = match Url::parse(&verify_url_for_task) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        app_message_sender.send(Message::Error(format!("Failed to parse URL: {}", e)));
+                        return;
+                    }
+                };
+
+                let local_manifest_path = verify_output_for_task
+                    .join("updater")
+                    .join(remote_url.host_str().unwrap_or("default"))
+                    .join("local_manifest.json");
+
+                let result = tokio::select! {
+                    res = verify_and_repair(
+                        &remote_url,
+                        &verify_manifest_for_task,
+                        &verify_output_for_task,
+                        &local_manifest_path,
+                        progress_state,
+                    ) => res,
+                    _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Verification cancelled"))
+                };
+
+                match result {
+                    Ok(repaired) => {
+                        app_message_sender.send(Message::VerifyComplete { repaired });
+                    }
+                    Err(e) => {
+                        error!("Verification failed: {}", e);
+                        app_message_sender.send(Message::Error(e.to_string()));
+                    }
+                }
+                return;
+            }
+
             let result = tokio::select! {
                 res = update_process(&args, progress_state) => res,
                 _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Download cancelled"))
@@ -629,6 +864,10 @@ async fn main() -> anyhow::Result<()> {
                     launch_button.activate();
                     launch_button.change_state(launch_button::LaunchButtonState::Play);
                     launch_button.redraw();
+                    verify_button.set_label("Verify");
+                    verify_button.activate();
+                    verify_button.show();
+                    verify_button.redraw();
                     progress_state.set_stage(ProgressStage::Play);
                 }
                 Message::Shutdown => {
@@ -646,6 +885,40 @@ async fn main() -> anyhow::Result<()> {
                     );
                     break;
                 }
+                Message::VerifyStarted => {
+                    launch_button.deactivate();
+                    launch_button.redraw();
+                }
+                Message::VerifyComplete { repaired } => {
+                    info!(repaired, "Verification complete");
+                    launch_button.activate();
+                    launch_button.redraw();
+                    verify_button.set_label("Verify");
+                    verify_button.activate();
+                    verify_button.redraw();
+                    progress_state.set_stage(ProgressStage::Play);
+
+                    let message = if repaired == 0 {
+                        "All files verified successfully".to_string()
+                    } else {
+                        format!("Repaired {} file(s)", repaired)
+                    };
+
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Info)
+                        .set_title("Verification Complete")
+                        .set_description(&message)
+                        .show();
+                }
+                Message::VerifyCancelled => {
+                    info!("Verification cancelled");
+                    launch_button.activate();
+                    launch_button.redraw();
+                    verify_button.set_label("Verify");
+                    verify_button.activate();
+                    verify_button.redraw();
+                    progress_state.set_stage(ProgressStage::Play);
+                }
             }
         }
 
@@ -659,9 +932,10 @@ async fn main() -> anyhow::Result<()> {
             background_frame.redraw();
             main_progress_bar.redraw();
 
-            // We need to redraw the button ontop of the background frame after
+            // We need to redraw the buttons ontop of the background frame after
             // we've redrawn it
             launch_button.redraw();
+            verify_button.redraw();
         }
 
         let current_progress = progress_state.current_progress() as usize;

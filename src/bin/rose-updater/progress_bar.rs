@@ -116,6 +116,9 @@ impl ProgressBar {
                             format_size(max, DECIMAL)
                         )
                     }
+                    ProgressStage::VerifyingFiles => {
+                        format!("Verifying files - {} / {}", value, max)
+                    }
                     _ => "".into(),
                 };
 
