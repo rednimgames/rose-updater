@@ -34,3 +34,5 @@ jobs:
 
       - name: Build in release mode
         run: cargo build --release
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C link-arg=-weak_framework -C link-arg=ScreenCaptureKit -C link-arg=-weak_framework -C link-arg=UniformTypeIdentifiers' || '' }}
