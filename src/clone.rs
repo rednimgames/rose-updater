@@ -55,7 +55,7 @@ const REMOTE_CHUNK_BUFFER_SIZE: usize = 64;
 pub async fn init_remote_archive_reader(url: reqwest::Url) -> anyhow::Result<RemoteArchiveReader> {
     let client = reqwest::ClientBuilder::new()
         .brotli(true)
-        .dns_resolver2(CloudflareResolver::new())
+        .dns_resolver(CloudflareResolver::new())
         .build()
         .context("Failed to build request client")?
         .get(url.clone());
