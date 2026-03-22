@@ -61,7 +61,7 @@ struct Args {
     chunk_size: usize,
 
     /// Relative path to the updater program in the input directory
-    #[clap(long, default_value = "rose-updater.exe")]
+    #[clap(long, default_value = if cfg!(windows) { "rose-updater.exe" } else { "rose-updater" })]
     updater: PathBuf,
 }
 
