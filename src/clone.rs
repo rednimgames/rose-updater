@@ -44,7 +44,7 @@ use futures::StreamExt;
 
 use tokio::fs;
 
-use crate::{dns::CloudflareResolver, progress::ProgressState};
+use crate::{dns::CloudflareResolver, error::ErrorCode, progress::ProgressState};
 
 pub type RemoteArchiveReader = bitar::Archive<bitar::archive_reader::HttpReader>;
 
@@ -57,13 +57,13 @@ pub async fn init_remote_archive_reader(url: reqwest::Url) -> anyhow::Result<Rem
         .brotli(true)
         .dns_resolver(CloudflareResolver::new())
         .build()
-        .context("Failed to build request client")?
+        .context(ErrorCode::SetupConnection.to_string())?
         .get(url.clone());
 
     let http_reader = bitar::archive_reader::HttpReader::from_request(client).retries(4);
     let archive = bitar::Archive::try_init(http_reader)
         .await
-        .with_context(|| format!("Failed to read remote archive at {}", &url))?;
+        .with_context(|| format!("{} ({})", ErrorCode::DownloadArchive, &url))?;
 
     Ok(archive)
 }
@@ -90,7 +90,8 @@ pub async fn estimate_local_chunk_count(
         .await
         .with_context(|| {
             format!(
-                "Failed to read file metadata for {}",
+                "{} ({})",
+                ErrorCode::ReadFileMetadata,
                 local_file_path.display()
             )
         })?;
@@ -119,7 +120,8 @@ pub async fn build_local_chunk_index(
         .await
         .with_context(|| {
             format!(
-                "Failed to open the local file for reading at {}",
+                "{} ({})",
+                ErrorCode::OpenFileForReading,
                 local_file_path.display()
             )
         })?;
@@ -140,7 +142,9 @@ pub async fn build_local_chunk_index(
 
     let mut chunk_index = bitar::ChunkIndex::new_empty(archive_reader.chunk_hash_length());
     while let Some(r) = chunk_stream.next().await {
-        let (chunk_offset, verified) = r??;
+        let (chunk_offset, verified) = r
+            .context(ErrorCode::VerifyLocalFile.to_string())?
+            .context(ErrorCode::VerifyLocalFile.to_string())?;
         let (hash, chunk) = verified.into_parts();
         chunk_index.add_chunk(hash, chunk.len(), &[chunk_offset]);
 
@@ -164,10 +168,7 @@ pub async fn init_local_clone_output(
 ) -> anyhow::Result<CloneOutput<tokio::fs::File>> {
     if let Some(parent) = local_file_path.parent() {
         fs::create_dir_all(parent).await.with_context(|| {
-            format!(
-                "Failed to create directory to clone into: {}",
-                parent.display()
-            )
+            format!("{} ({})", ErrorCode::CreateFolder, parent.display())
         })?;
     }
     let local_file = tokio::fs::OpenOptions::new()
@@ -179,13 +180,17 @@ pub async fn init_local_clone_output(
         .await
         .with_context(|| {
             format!(
-                "Failed to open the local file for cloning at {}",
+                "{} ({})",
+                ErrorCode::OpenFileForWriting,
                 local_file_path.display()
             )
         })?;
 
     let mut clone_output = CloneOutput::new(local_file, archive_reader.build_source_index());
-    let _size = clone_output.reorder_in_place(local_chunk_index).await?;
+    let _size = clone_output
+        .reorder_in_place(local_chunk_index)
+        .await
+        .context(ErrorCode::PrepareFileForUpdate.to_string())?;
     Ok(clone_output)
 }
 
@@ -205,16 +210,27 @@ pub async fn clone_remote_file(
         .chunk_stream(clone_output.chunks())
         .map(|archive_chunk| {
             tokio::task::spawn_blocking(move || -> anyhow::Result<bitar::VerifiedChunk> {
-                let compressed = archive_chunk?;
-                let verified = compressed.decompress()?.verify()?;
+                let compressed = archive_chunk
+                    .context(ErrorCode::DownloadChunk.to_string())?;
+                let decompressed = compressed
+                    .decompress()
+                    .context(ErrorCode::CorruptDownload.to_string())?;
+                let verified = decompressed
+                    .verify()
+                    .context(ErrorCode::IntegrityCheckFailed.to_string())?;
                 Ok(verified)
             })
         })
         .buffered(REMOTE_CHUNK_BUFFER_SIZE);
 
     while let Some(r) = chunk_stream.next().await {
-        let verified = r??;
-        let bytes_written = clone_output.feed(&verified).await?;
+        let verified = r
+            .context(ErrorCode::ProcessDownloadedData.to_string())?
+            .context(ErrorCode::ProcessDownloadedData.to_string())?;
+        let bytes_written = clone_output
+            .feed(&verified)
+            .await
+            .context(ErrorCode::WriteUpdateToDisk.to_string())?;
 
         // When "feeding" verified chunks to the clone output, some chunks may
         // already exist in the target location and the result will be 0 bytes

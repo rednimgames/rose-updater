@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::info;
 
+use crate::error::ErrorCode;
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RemoteManifest {
     pub version: usize,
@@ -46,7 +48,9 @@ pub async fn get_or_create_local_manifest(path: &Path) -> anyhow::Result<LocalMa
     {
         info!(local_manifest_path=%path.display(), "Using existing manifest file");
 
-        let manifest_file = fs::File::open(&path).await?;
+        let manifest_file = fs::File::open(&path)
+            .await
+            .context(ErrorCode::ReadLocalData.to_string())?;
         match serde_json::from_reader(manifest_file.into_std().await) {
             Ok(manifest) => manifest,
             Err(_) => {
@@ -72,11 +76,16 @@ pub async fn save_local_manifest(
     );
 
     if let Some(manifest_parent_dir) = manifest_path.parent() {
-        fs::create_dir_all(manifest_parent_dir).await?;
+        fs::create_dir_all(manifest_parent_dir)
+            .await
+            .context(ErrorCode::SaveProgress.to_string())?;
     }
 
-    let manifest_file = fs::File::create(manifest_path).await?;
-    serde_json::to_writer(manifest_file.into_std().await, &manfiest)?;
+    let manifest_file = fs::File::create(manifest_path)
+        .await
+        .context(ErrorCode::SaveProgress.to_string())?;
+    serde_json::to_writer(manifest_file.into_std().await, &manfiest)
+        .context(ErrorCode::SaveProgress.to_string())?;
 
     Ok(())
 }
@@ -85,12 +94,20 @@ pub async fn download_remote_manifest(
     remote_url: &Url,
     manifest_name: &str,
 ) -> anyhow::Result<RemoteManifest> {
-    let remote_manifest_url = remote_url.join(manifest_name)?;
+    let remote_manifest_url = remote_url
+        .join(manifest_name)
+        .context(ErrorCode::InvalidServerAddress.to_string())?;
 
     info!(url=% remote_manifest_url.as_str(), "Downloading remote manifest");
 
-    Ok(reqwest::get(remote_manifest_url)
-        .await?
+    let response = reqwest::get(remote_manifest_url)
+        .await
+        .context(ErrorCode::DownloadManifest.to_string())?;
+
+    let manifest = response
         .json::<RemoteManifest>()
-        .await?)
+        .await
+        .context(ErrorCode::InvalidServerData.to_string())?;
+
+    Ok(manifest)
 }
