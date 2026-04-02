@@ -162,6 +162,15 @@ async fn update_updater(
             .context(ErrorCode::ReplaceLauncherFile.to_string())?;
     }
 
+    // Set execute permission on Unix platforms
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&local_updater_path, perms)
+            .context(ErrorCode::ReplaceLauncherFile.to_string())?;
+    }
+
     info!(
         "Cloned {} to {}",
         &remote_url,
@@ -475,6 +484,18 @@ async fn update_process(
     get_remote_files(&remote_url, &files_to_update, &args.output, progress_state)
         .await
         .context(ErrorCode::CheckForUpdates.to_string())?;
+
+    // Set execute permission on the game executable for Unix platforms
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe_path = args.output.join(&args.exe);
+        if exe_path.exists() {
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&exe_path, perms)
+                .context("Failed to set execute permission on game executable")?;
+        }
+    }
 
     let mut new_local_manifest = LocalManifest {
         version: LOCAL_MANIFEST_VERSION,
