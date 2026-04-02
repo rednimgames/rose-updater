@@ -362,7 +362,12 @@ async fn update_process(
         .context(ErrorCode::CreateGameFolder.to_string())?;
 
     // Get the base URL for our update remote
-    let remote_url = Url::parse(&args.url)
+    // Ensure trailing slash so Url::join() appends to the path instead of replacing the last segment
+    let mut url_str = args.url.clone();
+    if !url_str.ends_with('/') {
+        url_str.push('/');
+    }
+    let remote_url = Url::parse(&url_str)
         .context(format!("{} ({})", ErrorCode::InvalidServerAddress, args.url))?;
 
     // The updater can use different "profiles" to use the same updater for different clients

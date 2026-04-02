@@ -1844,7 +1844,7 @@ dependencies = [
 
 [[package]]
 name = "rose_update"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "bitar",
