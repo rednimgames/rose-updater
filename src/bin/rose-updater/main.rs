@@ -37,11 +37,29 @@ const LOCAL_MANIFEST_VERSION: usize = 1;
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 
+const fn default_url() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "https://updates2.roseonlinegame.com/macos"
+    } else if cfg!(target_os = "linux") {
+        "https://updates2.roseonlinegame.com/linux-x64"
+    } else {
+        "https://updates2.roseonlinegame.com"
+    }
+}
+
+const fn default_exe() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "trose.exe"
+    } else {
+        "trose"
+    }
+}
+
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
     /// Remote archive URL
-    #[clap(long, default_value = "https://updates2.roseonlinegame.com")]
+    #[clap(long, default_value = default_url())]
     url: String,
 
     /// Output directory
@@ -73,7 +91,7 @@ struct Args {
     verify: bool,
 
     /// Executable to run after updating
-    #[clap(long, default_value = "trose.exe")]
+    #[clap(long, default_value = default_exe())]
     exe: PathBuf,
 
     /// Working directory to run the executable
@@ -141,6 +159,15 @@ async fn update_updater(
     if new_updater_temp_path.exists() {
         fs::rename(&new_updater_temp_path, &local_updater_path)
             .await
+            .context(ErrorCode::ReplaceLauncherFile.to_string())?;
+    }
+
+    // Set execute permission on Unix platforms
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&local_updater_path, perms)
             .context(ErrorCode::ReplaceLauncherFile.to_string())?;
     }
 
@@ -362,8 +389,16 @@ async fn update_process(
         .context(ErrorCode::CreateGameFolder.to_string())?;
 
     // Get the base URL for our update remote
-    let remote_url = Url::parse(&args.url)
-        .context(format!("{} ({})", ErrorCode::InvalidServerAddress, args.url))?;
+    // Ensure trailing slash so Url::join() appends to the path instead of replacing the last segment
+    let mut url_str = args.url.clone();
+    if !url_str.ends_with('/') {
+        url_str.push('/');
+    }
+    let remote_url = Url::parse(&url_str).context(format!(
+        "{} ({})",
+        ErrorCode::InvalidServerAddress,
+        args.url
+    ))?;
 
     // The updater can use different "profiles" to use the same updater for different clients
     let local_manifest_path = args
@@ -424,8 +459,8 @@ async fn update_process(
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
         info!("Restarting updater");
-        let current_exe = env::current_exe()
-            .context(ErrorCode::FindLauncherLocation.to_string())?;
+        let current_exe =
+            env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
         process::Command::new(current_exe)
             .args(
                 env::args()
@@ -450,6 +485,18 @@ async fn update_process(
         .await
         .context(ErrorCode::CheckForUpdates.to_string())?;
 
+    // Set execute permission on the game executable for Unix platforms
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe_path = args.output.join(&args.exe);
+        if exe_path.exists() {
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&exe_path, perms)
+                .context("Failed to set execute permission on game executable")?;
+        }
+    }
+
     let mut new_local_manifest = LocalManifest {
         version: LOCAL_MANIFEST_VERSION,
         updater: local_manifest.updater,
@@ -473,10 +520,7 @@ async fn update_process(
 enum Message {
     Launch,
     Shutdown,
-    Error {
-        message: String,
-        details: String,
-    },
+    Error { message: String, details: String },
 }
 
 #[tokio::main]
@@ -728,8 +772,7 @@ fn setup_logging(
 
     let log_file_path = project_dirs.data_local_dir().join("rose-updater.log");
     if let Some(log_file_dir) = log_file_path.parent() {
-        std::fs::create_dir_all(log_file_dir)
-            .context(ErrorCode::InitLogging.to_string())?;
+        std::fs::create_dir_all(log_file_dir).context(ErrorCode::InitLogging.to_string())?;
     }
 
     let log_file = std::fs::OpenOptions::new()
