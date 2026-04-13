@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -20,6 +21,14 @@ use tokio::fs;
 use tracing::{error, info, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::Foundation::ERROR_ELEVATION_REQUIRED;
+#[cfg(windows)]
+use windows::Win32::UI::Shell::{
+    ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, SHELLEXECUTE_MASK_FLAGS,
+};
 
 use rose_update::clone::{
     build_local_chunk_index, clone_remote_file, estimate_local_chunk_count,
@@ -180,57 +189,7 @@ async fn update_updater(
     Ok(())
 }
 
-/// Spawn a detached process. On Windows, uses `ShellExecuteExW` instead of `CreateProcess`
-/// so that executables with a UAC elevation manifest are handled correctly (avoids
-/// error 740 / ERROR_ELEVATION_REQUIRED that `std::process::Command::spawn` would return).
-#[cfg(windows)]
-fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
-
-    fn to_wide(s: &OsStr) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    fn args_to_wide(args: &[String]) -> Vec<u16> {
-        let joined = args
-            .iter()
-            .map(|a| {
-                if a.contains(' ') {
-                    format!("\"{}\"", a.replace('"', "\\\""))
-                } else {
-                    a.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        to_wide(OsStr::new(&joined))
-    }
-
-    let file_wide = to_wide(exe.as_os_str());
-    let params_wide = args_to_wide(args);
-    let dir_wide = working_dir.map(|d| to_wide(d.as_os_str()));
-
-    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.lpFile = PCWSTR(file_wide.as_ptr());
-    info.lpParameters = if args.is_empty() {
-        PCWSTR::null()
-    } else {
-        PCWSTR(params_wide.as_ptr())
-    };
-    info.lpDirectory = dir_wide
-        .as_ref()
-        .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr()));
-    info.nShow = 1; // SW_SHOWNORMAL
-
-    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| anyhow::anyhow!("{}", e))
-}
-
-#[cfg(not(windows))]
-fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) -> io::Result<()> {
     let mut cmd = process::Command::new(exe);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -241,6 +200,327 @@ fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> any
         .stderr(process::Stdio::null())
         .spawn()?;
     Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct ShellExecuteSpec {
+    file: PathBuf,
+    parameters: Option<Vec<u16>>,
+    directory: Option<PathBuf>,
+    mask: SHELLEXECUTE_MASK_FLAGS,
+}
+
+#[cfg(windows)]
+fn should_use_shell_fallback(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED.0 as i32)
+}
+
+#[cfg(windows)]
+fn resolve_shell_file(exe: &Path, working_dir: Option<&Path>) -> io::Result<PathBuf> {
+    let exe = if exe.is_absolute() {
+        exe.to_path_buf()
+    } else if let Some(dir) = working_dir {
+        if let Ok(stripped) = exe.strip_prefix(dir) {
+            dir.join(stripped)
+        } else {
+            dir.join(exe)
+        }
+    } else {
+        exe.to_path_buf()
+    };
+
+    std::path::absolute(exe)
+}
+
+#[cfg(windows)]
+fn append_windows_arg(cmd: &mut Vec<u16>, arg: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes = arg.as_bytes();
+    let quote = bytes.iter().any(|byte| matches!(*byte, b' ' | b'\t')) || bytes.is_empty();
+    if quote {
+        cmd.push('"' as u16);
+    }
+
+    let mut backslashes = 0usize;
+    for code_unit in OsStr::new(arg).encode_wide() {
+        if code_unit == '\\' as u16 {
+            backslashes += 1;
+        } else {
+            if code_unit == '"' as u16 {
+                cmd.extend((0..=backslashes).map(|_| '\\' as u16));
+            }
+            backslashes = 0;
+        }
+        cmd.push(code_unit);
+    }
+
+    if quote {
+        cmd.extend((0..backslashes).map(|_| '\\' as u16));
+        cmd.push('"' as u16);
+    }
+}
+
+#[cfg(windows)]
+fn encode_windows_command_line(args: &[String]) -> Vec<u16> {
+    let mut command_line = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            command_line.push(' ' as u16);
+        }
+        append_windows_arg(&mut command_line, arg);
+    }
+    command_line
+}
+
+#[cfg(windows)]
+fn build_shell_execute_spec(
+    exe: &Path,
+    args: &[String],
+    working_dir: Option<&Path>,
+) -> io::Result<ShellExecuteSpec> {
+    let file = resolve_shell_file(exe, working_dir)?;
+    let directory = working_dir.map(std::path::absolute).transpose()?;
+    let parameters = (!args.is_empty()).then(|| {
+        let mut encoded = encode_windows_command_line(args);
+        encoded.push(0);
+        encoded
+    });
+
+    Ok(ShellExecuteSpec {
+        file,
+        parameters,
+        directory,
+        // The launcher exits almost immediately after a successful ShellExecuteExW call.
+        // Force the shell work to complete on this thread before returning.
+        mask: SEE_MASK_NOASYNC,
+    })
+}
+
+#[cfg(windows)]
+fn spawn_process_shell(spec: &ShellExecuteSpec) -> anyhow::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    fn to_wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let file_wide = to_wide(spec.file.as_os_str());
+    let dir_wide = spec.directory.as_ref().map(|dir| to_wide(dir.as_os_str()));
+
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = spec.mask;
+    info.lpFile = PCWSTR(file_wide.as_ptr());
+    info.lpParameters = spec
+        .parameters
+        .as_ref()
+        .map_or(PCWSTR::null(), |params| PCWSTR(params.as_ptr()));
+    info.lpDirectory = dir_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr()));
+    info.nShow = 1; // SW_SHOWNORMAL
+
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|error| anyhow::anyhow!("{}", error))
+}
+
+/// Spawn a detached process. On Windows, try the standard library's CreateProcess path first
+/// and only fall back to ShellExecuteExW for executables that require elevation.
+#[cfg(windows)]
+fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    match spawn_process_std(exe, args, working_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if should_use_shell_fallback(&error) => {
+            let spec = build_shell_execute_spec(exe, args, working_dir)?;
+            spawn_process_shell(&spec)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    spawn_process_std(exe, args, working_dir)?;
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_spawn_tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn CommandLineToArgvW(command_line: *const u16, argc: *mut i32) -> *mut *mut u16;
+    }
+
+    fn parse_command_line(command_line: &[u16]) -> Vec<String> {
+        let mut argc = 0;
+        let argv = unsafe { CommandLineToArgvW(command_line.as_ptr(), &mut argc) };
+        assert!(!argv.is_null(), "CommandLineToArgvW failed");
+
+        let args = unsafe {
+            (0..argc as usize)
+                .map(|index| {
+                    let arg = *argv.add(index);
+                    let mut len = 0usize;
+                    while *arg.add(len) != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16(std::slice::from_raw_parts(arg, len)).unwrap()
+                })
+                .collect()
+        };
+
+        unsafe {
+            let _ = LocalFree(argv.cast());
+        }
+
+        args
+    }
+
+    fn round_trip_shell_args(args: &[String]) -> Vec<String> {
+        let mut command_line: Vec<u16> = "launcher.exe".encode_utf16().collect();
+        let encoded_args = encode_windows_command_line(args);
+        if !encoded_args.is_empty() {
+            command_line.push(' ' as u16);
+            command_line.extend_from_slice(&encoded_args);
+        }
+        command_line.push(0);
+        parse_command_line(&command_line)
+            .into_iter()
+            .skip(1)
+            .collect()
+    }
+
+    #[test]
+    fn preserves_single_trailing_backslash() {
+        let args = vec![r"C:\Program Files\Rose\".to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_multiple_trailing_backslashes() {
+        let args = vec![r"C:\Program Files\Rose\\".to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_embedded_quotes() {
+        let args = vec![r#"has\"quote"#.to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_backslashes_before_quote() {
+        let args = vec![r#"a\\\"b c"#.to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_empty_arguments() {
+        let args = vec![String::new()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_tab_arguments() {
+        let args = vec!["a\tb".to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_multi_argument_command_lines() {
+        let args = vec![
+            "--init".to_string(),
+            "--server".to_string(),
+            "connect.roseonlinegame.com".to_string(),
+            r"C:\Program Files\Rose\".to_string(),
+        ];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn resolves_default_windows_launch_paths_to_absolute() {
+        let spec =
+            build_shell_execute_spec(Path::new("trose.exe"), &[], Some(Path::new("."))).unwrap();
+
+        assert_eq!(
+            spec.file,
+            std::path::absolute(Path::new("./trose.exe")).unwrap()
+        );
+        assert_eq!(
+            spec.directory,
+            Some(std::path::absolute(Path::new(".")).unwrap())
+        );
+    }
+
+    #[test]
+    fn resolves_relative_executable_against_custom_directory() {
+        let spec =
+            build_shell_execute_spec(Path::new("trose.exe"), &[], Some(Path::new("game"))).unwrap();
+
+        assert_eq!(
+            spec.file,
+            std::path::absolute(Path::new("game/trose.exe")).unwrap()
+        );
+        assert_eq!(
+            spec.directory,
+            Some(std::path::absolute(Path::new("game")).unwrap())
+        );
+    }
+
+    #[test]
+    fn does_not_join_prefixed_relative_paths_twice() {
+        let spec =
+            build_shell_execute_spec(Path::new("game/trose.exe"), &[], Some(Path::new("game")))
+                .unwrap();
+
+        assert_eq!(
+            spec.file,
+            std::path::absolute(Path::new("game/trose.exe")).unwrap()
+        );
+    }
+
+    #[test]
+    fn preserves_absolute_executable_paths() {
+        let absolute_exe = std::path::absolute(Path::new("trose.exe")).unwrap();
+        let spec = build_shell_execute_spec(&absolute_exe, &[], Some(Path::new("game"))).unwrap();
+
+        assert_eq!(spec.file, absolute_exe);
+        assert_eq!(
+            spec.directory,
+            Some(std::path::absolute(Path::new("game")).unwrap())
+        );
+    }
+
+    #[test]
+    fn falls_back_only_for_elevation_required() {
+        assert!(should_use_shell_fallback(&io::Error::from_raw_os_error(
+            ERROR_ELEVATION_REQUIRED.0 as i32
+        )));
+        assert!(!should_use_shell_fallback(&io::Error::from_raw_os_error(5)));
+    }
+
+    #[test]
+    fn shell_execute_request_sets_no_async_mask() {
+        let spec = build_shell_execute_spec(
+            Path::new("trose.exe"),
+            &["--init".to_string()],
+            Some(Path::new(".")),
+        )
+        .unwrap();
+
+        assert_eq!(spec.mask, SEE_MASK_NOASYNC);
+    }
 }
 
 #[derive(Debug)]
