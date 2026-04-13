@@ -168,6 +168,8 @@ struct FileToDownload {
     remote_path: String,
 }
 
+type VerifyCancelState = Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RemoteFilePass {
     scan_stage: ProgressStage,
@@ -203,6 +205,54 @@ fn is_text_file_path(path: &Path) -> bool {
 
 fn should_remove_text_file(pass: RemoteFilePass, path: &Path) -> bool {
     pass.delete_text_files && is_text_file_path(path)
+}
+
+fn local_manifest_path(output_dir: &Path, remote_url: &Url) -> PathBuf {
+    output_dir
+        .join("updater")
+        .join(remote_url.host_str().unwrap_or("default"))
+        .join("local_manifest.json")
+}
+
+fn updater_manifest_entry(remote_manifest: &RemoteManifest) -> LocalManifestFileEntry {
+    LocalManifestFileEntry {
+        path: remote_manifest.updater.source_path.clone(),
+        hash: remote_manifest.updater.source_hash.clone(),
+        size: remote_manifest.updater.source_size,
+    }
+}
+
+fn build_local_manifest(
+    remote_manifest: &RemoteManifest,
+    updater: LocalManifestFileEntry,
+) -> LocalManifest {
+    let mut local_manifest = LocalManifest {
+        version: LOCAL_MANIFEST_VERSION,
+        updater,
+        ..Default::default()
+    };
+
+    for file in &remote_manifest.files {
+        local_manifest.files.push(LocalManifestFileEntry {
+            path: file.source_path.clone(),
+            hash: file.source_hash.clone(),
+            size: file.source_size,
+        });
+    }
+
+    local_manifest
+}
+
+async fn run_verify_process(
+    verify_url: &str,
+    manifest_name: &str,
+    output_dir: &Path,
+    progress_state: ProgressState,
+) -> anyhow::Result<usize> {
+    let remote_url =
+        Url::parse(verify_url).context(format!("Failed to parse the url {}", verify_url))?;
+
+    verify_and_repair(&remote_url, manifest_name, output_dir, progress_state).await
 }
 
 /// Check which files need to be updated by comparing our local manifest to the remote manifest
@@ -409,7 +459,6 @@ async fn verify_and_repair(
     remote_url: &Url,
     manifest_name: &str,
     output_dir: &Path,
-    local_manifest_path: &Path,
     progress_state: ProgressState,
 ) -> anyhow::Result<usize> {
     progress_state.set_stage(ProgressStage::FetchingMetadata);
@@ -431,20 +480,10 @@ async fn verify_and_repair(
     .await?;
 
     // Update local manifest to match remote after verification
-    let local_manifest = get_or_create_local_manifest(local_manifest_path).await?;
-    let mut new_local_manifest = LocalManifest {
-        version: LOCAL_MANIFEST_VERSION,
-        updater: local_manifest.updater,
-        ..Default::default()
-    };
-    for file in &remote_manifest.files {
-        new_local_manifest.files.push(LocalManifestFileEntry {
-            path: file.source_path.clone(),
-            hash: file.source_hash.clone(),
-            size: file.source_size,
-        });
-    }
-    save_local_manifest(local_manifest_path, &new_local_manifest).await?;
+    let local_manifest_path = local_manifest_path(output_dir, remote_url);
+    let local_manifest = get_or_create_local_manifest(&local_manifest_path).await?;
+    let new_local_manifest = build_local_manifest(&remote_manifest, local_manifest.updater);
+    save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
     info!(files_repaired, "Verification complete");
 
@@ -466,11 +505,7 @@ async fn update_process(
         Url::parse(&args.url).context(format!("Failed to parse the url {}", args.url))?;
 
     // The updater can use different "profiles" to use the same updater for different clients
-    let local_manifest_path = args
-        .output
-        .join("updater")
-        .join(remote_url.host_str().unwrap_or("default"))
-        .join("local_manifest.json");
+    let local_manifest_path = local_manifest_path(&args.output, &remote_url);
 
     info!(%remote_url, local_manifest_path=%local_manifest_path.display(), output_dir=%args.output.display(), "Starting update process");
 
@@ -507,11 +542,7 @@ async fn update_process(
         // rest of the data should be updated the next time we run the updater.
         let new_local_manifest = LocalManifest {
             version: LOCAL_MANIFEST_VERSION,
-            updater: LocalManifestFileEntry {
-                path: remote_manifest.updater.source_path.clone(),
-                hash: remote_manifest.updater.source_hash.clone(),
-                size: remote_manifest.updater.source_size,
-            },
+            updater: updater_manifest_entry(&remote_manifest),
             ..local_manifest
         };
 
@@ -567,19 +598,7 @@ async fn update_process(
         );
     }
 
-    let mut new_local_manifest = LocalManifest {
-        version: LOCAL_MANIFEST_VERSION,
-        updater: local_manifest.updater,
-        ..Default::default()
-    };
-
-    for file in &remote_manifest.files {
-        new_local_manifest.files.push(LocalManifestFileEntry {
-            path: file.source_path.clone(),
-            hash: file.source_hash.clone(),
-            size: file.source_size,
-        });
-    }
+    let new_local_manifest = build_local_manifest(&remote_manifest, local_manifest.updater);
 
     save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
@@ -708,8 +727,7 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // verify cancellation channel
-    let verify_cancel_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let verify_cancel_tx: VerifyCancelState = Arc::new(tokio::sync::Mutex::new(None));
 
     // Create our updaters
     let progress_state = ProgressState::default();
@@ -793,28 +811,11 @@ async fn main() -> anyhow::Result<()> {
                     *guard = Some(cancel_send);
                 }
 
-                let remote_url = match Url::parse(&verify_url) {
-                    Ok(url) => url,
-                    Err(e) => {
-                        let mut guard = cancel_tx_clone.lock().await;
-                        *guard = None;
-                        app_message_sender
-                            .send(Message::VerifyFailed(format!("Failed to parse URL: {}", e)));
-                        return;
-                    }
-                };
-
-                let local_manifest_path = verify_output
-                    .join("updater")
-                    .join(remote_url.host_str().unwrap_or("default"))
-                    .join("local_manifest.json");
-
                 let result = tokio::select! {
-                    res = verify_and_repair(
-                        &remote_url,
+                    res = run_verify_process(
+                        &verify_url,
                         &verify_manifest_name,
                         &verify_output,
-                        &local_manifest_path,
                         progress_state,
                     ) => res,
                     _ = cancel_recv.changed() => {
@@ -859,26 +860,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             if verify_only {
                 // --verify flag: skip update, go straight to verify+repair
-                let remote_url = match Url::parse(&verify_url_for_task) {
-                    Ok(url) => url,
-                    Err(e) => {
-                        app_message_sender
-                            .send(Message::Error(format!("Failed to parse URL: {}", e)));
-                        return;
-                    }
-                };
-
-                let local_manifest_path = verify_output_for_task
-                    .join("updater")
-                    .join(remote_url.host_str().unwrap_or("default"))
-                    .join("local_manifest.json");
-
                 let result = tokio::select! {
-                    res = verify_and_repair(
-                        &remote_url,
+                    res = run_verify_process(
+                        &verify_url_for_task,
                         &verify_manifest_for_task,
                         &verify_output_for_task,
-                        &local_manifest_path,
                         progress_state,
                     ) => res,
                     _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Verification cancelled"))
