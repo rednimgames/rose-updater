@@ -180,6 +180,69 @@ async fn update_updater(
     Ok(())
 }
 
+/// Spawn a detached process. On Windows, uses `ShellExecuteExW` instead of `CreateProcess`
+/// so that executables with a UAC elevation manifest are handled correctly (avoids
+/// error 740 / ERROR_ELEVATION_REQUIRED that `std::process::Command::spawn` would return).
+#[cfg(windows)]
+fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
+
+    fn to_wide(s: &OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn args_to_wide(args: &[String]) -> Vec<u16> {
+        let joined = args
+            .iter()
+            .map(|a| {
+                if a.contains(' ') {
+                    format!("\"{}\"", a.replace('"', "\\\""))
+                } else {
+                    a.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        to_wide(OsStr::new(&joined))
+    }
+
+    let file_wide = to_wide(exe.as_os_str());
+    let params_wide = args_to_wide(args);
+    let dir_wide = working_dir.map(|d| to_wide(d.as_os_str()));
+
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.lpFile = PCWSTR(file_wide.as_ptr());
+    info.lpParameters = if args.is_empty() {
+        PCWSTR::null()
+    } else {
+        PCWSTR(params_wide.as_ptr())
+    };
+    info.lpDirectory = dir_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr()));
+    info.nShow = 1; // SW_SHOWNORMAL
+
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+#[cfg(not(windows))]
+fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    let mut cmd = process::Command::new(exe);
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    cmd.args(args)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct FileToDownload {
     /// Path to file in local directory
@@ -461,18 +524,12 @@ async fn update_process(
         info!("Restarting updater");
         let current_exe =
             env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
-        process::Command::new(current_exe)
-            .args(
-                env::args()
-                    .skip(1)
-                    // Prevent infinite loop of update rechecks by removing the forced updater check
-                    .filter(|arg| !arg.contains("force-recheck-updater")),
-            )
-            // Don't share handles so child process can exit cleanly
-            .stdin(process::Stdio::null())
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .spawn()
+        let restart_args: Vec<String> = env::args()
+            .skip(1)
+            // Prevent infinite loop of update rechecks by removing the forced updater check
+            .filter(|arg| !arg.contains("force-recheck-updater"))
+            .collect();
+        spawn_process(&current_exe, &restart_args, None)
             .context(ErrorCode::RestartLauncher.to_string())?;
 
         return Ok(UpdateProcessResult::UpdaterUpdated);
@@ -634,15 +691,7 @@ async fn main() -> anyhow::Result<()> {
 
         let exe = exe_dir.join(&exe);
 
-        match process::Command::new(&exe)
-            .current_dir(&exe_dir)
-            .args(&exe_args)
-            // Don't share handles so child process can exit cleanly
-            .stdin(process::Stdio::null())
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .spawn()
-        {
+        match spawn_process(&exe, &exe_args, Some(&exe_dir)) {
             Ok(_) => {
                 app.quit();
             }
