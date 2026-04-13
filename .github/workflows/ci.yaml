@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  version-bump:
+    name: Check version bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check version was bumped
+        run: |
+          MAIN_VERSION=$(git show origin/main:Cargo.toml | grep '^version' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          PR_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "main: $MAIN_VERSION  PR: $PR_VERSION"
+          if [ "$MAIN_VERSION" = "$PR_VERSION" ]; then
+            echo "Error: Cargo.toml version must be bumped before merging (currently $PR_VERSION)"
+            exit 1
+          fi
+
+  build:
+    name: Build on ${{ matrix.os }}
+    needs: version-bump
+    if: always() && (needs.version-bump.result == 'success' || needs.version-bump.result == 'skipped')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies (Ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build in release mode
+        run: cargo build --release
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C link-arg=-weak_framework -C link-arg=ScreenCaptureKit -C link-arg=-weak_framework -C link-arg=UniformTypeIdentifiers' || '' }}

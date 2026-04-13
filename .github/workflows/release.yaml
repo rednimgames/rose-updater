@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+            archiver_binary: target/release/rose-updater-archiver
+            archiver_asset: rose-updater-archiver-linux-x64
+            updater_binary: target/release/rose-updater
+            updater_asset: rose-updater-linux-x64
+          - os: macos-latest
+            name: macos
+            archiver_binary: target/release/rose-updater-archiver
+            archiver_asset: rose-updater-archiver-macos
+            updater_binary: target/release/rose-updater
+            updater_asset: rose-updater-macos
+          - os: windows-latest
+            name: windows-x64
+            archiver_binary: target/release/rose-updater-archiver.exe
+            archiver_asset: rose-updater-archiver-windows-x64.exe
+            updater_binary: target/release/rose-updater.exe
+            updater_asset: rose-updater-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies (Ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+        env:
+          RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C link-arg=-weak_framework -C link-arg=ScreenCaptureKit -C link-arg=-weak_framework -C link-arg=UniformTypeIdentifiers' || '' }}
+
+      - name: Rename assets
+        shell: bash
+        run: |
+          mv ${{ matrix.archiver_binary }} ${{ matrix.archiver_asset }}
+          mv ${{ matrix.updater_binary }} ${{ matrix.updater_asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.name }}
+          path: |
+            ${{ matrix.archiver_asset }}
+            ${{ matrix.updater_asset }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: artifacts/*

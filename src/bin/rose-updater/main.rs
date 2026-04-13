@@ -15,6 +15,7 @@ use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
 use fltk_webview::FromFltkWindow;
 use reqwest::Url;
+use rose_update::error::ErrorCode;
 use rose_update::progress::{ProgressStage, ProgressState};
 use tokio::fs;
 use tracing::{error, info, Level};
@@ -37,11 +38,29 @@ const LOCAL_MANIFEST_VERSION: usize = 1;
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 
+const fn default_url() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "https://updates2.roseonlinegame.com/macos"
+    } else if cfg!(target_os = "linux") {
+        "https://updates2.roseonlinegame.com/linux-x64"
+    } else {
+        "https://updates2.roseonlinegame.com"
+    }
+}
+
+const fn default_exe() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "trose.exe"
+    } else {
+        "trose"
+    }
+}
+
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
     /// Remote archive URL
-    #[clap(long, default_value = "https://updates2.roseonlinegame.com")]
+    #[clap(long, default_value = default_url())]
     url: String,
 
     /// Output directory
@@ -73,7 +92,7 @@ struct Args {
     verify: bool,
 
     /// Executable to run after updating
-    #[clap(long, default_value = "trose.exe")]
+    #[clap(long, default_value = default_exe())]
     exe: PathBuf,
 
     /// Working directory to run the executable
@@ -124,7 +143,8 @@ async fn update_updater(
             .await
             .with_context(|| {
                 format!(
-                    "Failed to delete old updater at {}",
+                    "{} ({})",
+                    ErrorCode::RemoveOldLauncher,
                     old_updater_temp_path.display()
                 )
             })?;
@@ -133,22 +153,23 @@ async fn update_updater(
     if local_updater_path.exists() {
         fs::rename(&local_updater_path, &old_updater_temp_path)
             .await
-            .context(format!(
-                "Failed to rename the updater from {} to {}",
-                local_updater_path.display(),
-                old_updater_temp_path.display(),
-            ))?;
+            .context(ErrorCode::ReplaceLauncherFile.to_string())?;
     }
 
     // Rename the new updater from its temp path to the real path
     if new_updater_temp_path.exists() {
         fs::rename(&new_updater_temp_path, &local_updater_path)
             .await
-            .context(format!(
-                "Failed to rename the updater from {} to {}",
-                new_updater_temp_path.display(),
-                local_updater_path.display(),
-            ))?;
+            .context(ErrorCode::ReplaceLauncherFile.to_string())?;
+    }
+
+    // Set execute permission on Unix platforms
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&local_updater_path, perms)
+            .context(ErrorCode::ReplaceLauncherFile.to_string())?;
     }
 
     info!(
@@ -243,14 +264,22 @@ fn build_local_manifest(
     local_manifest
 }
 
+fn parse_remote_url(url: &str) -> anyhow::Result<Url> {
+    let mut url_str = url.to_owned();
+    if !url_str.ends_with('/') {
+        url_str.push('/');
+    }
+
+    Url::parse(&url_str).context(format!("{} ({})", ErrorCode::InvalidServerAddress, url))
+}
+
 async fn run_verify_process(
     verify_url: &str,
     manifest_name: &str,
     output_dir: &Path,
     progress_state: ProgressState,
 ) -> anyhow::Result<usize> {
-    let remote_url =
-        Url::parse(verify_url).context(format!("Failed to parse the url {}", verify_url))?;
+    let remote_url = parse_remote_url(verify_url)?;
 
     verify_and_repair(&remote_url, manifest_name, output_dir, progress_state).await
 }
@@ -303,7 +332,9 @@ async fn get_remote_files(
     let mut archive_readers = {
         let mut archive_reader_tasks = Vec::new();
         for file_data in files_to_update {
-            let file_url = base_url.join(&file_data.remote_path)?;
+            let file_url = base_url
+                .join(&file_data.remote_path)
+                .context(ErrorCode::InvalidServerAddress.to_string())?;
             let archive_reader_task = init_remote_archive_reader(file_url);
             archive_reader_tasks.push(archive_reader_task);
         }
@@ -498,11 +529,10 @@ async fn update_process(
 
     fs::create_dir_all(&args.output)
         .await
-        .context("Failed to create output directory")?;
+        .context(ErrorCode::CreateGameFolder.to_string())?;
 
     // Get the base URL for our update remote
-    let remote_url =
-        Url::parse(&args.url).context(format!("Failed to parse the url {}", args.url))?;
+    let remote_url = parse_remote_url(&args.url)?;
 
     // The updater can use different "profiles" to use the same updater for different clients
     let local_manifest_path = local_manifest_path(&args.output, &remote_url);
@@ -510,10 +540,14 @@ async fn update_process(
     info!(%remote_url, local_manifest_path=%local_manifest_path.display(), output_dir=%args.output.display(), "Starting update process");
 
     // Download the remote manifest
-    let remote_manifest = download_remote_manifest(&remote_url, &args.manifest_name).await?;
+    let remote_manifest = download_remote_manifest(&remote_url, &args.manifest_name)
+        .await
+        .context(ErrorCode::CheckForUpdates.to_string())?;
 
     // Load the local manifest (if it exists)
-    let local_manifest = get_or_create_local_manifest(&local_manifest_path).await?;
+    let local_manifest = get_or_create_local_manifest(&local_manifest_path)
+        .await
+        .context(ErrorCode::ReadLocalData.to_string())?;
 
     // First, we check if the updater itself needs an update. If it does then we
     // will only update the updater then start the process again to update the
@@ -524,7 +558,9 @@ async fn update_process(
     if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
-        let remote = remote_url.join(&remote_manifest.updater.path)?;
+        let remote = remote_url
+            .join(&remote_manifest.updater.path)
+            .context(ErrorCode::InvalidServerAddress.to_string())?;
 
         progress_state.set_stage(ProgressStage::UpdatingUpdater);
         progress_state.set_current_progress(0);
@@ -549,7 +585,9 @@ async fn update_process(
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
         info!("Restarting updater");
-        process::Command::new(env::current_exe()?)
+        let current_exe =
+            env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
+        process::Command::new(current_exe)
             .args(
                 env::args()
                     .skip(1)
@@ -560,7 +598,8 @@ async fn update_process(
             .stdin(process::Stdio::null())
             .stdout(process::Stdio::null())
             .stderr(process::Stdio::null())
-            .spawn()?;
+            .spawn()
+            .context(ErrorCode::RestartLauncher.to_string())?;
 
         return Ok(UpdateProcessResult::UpdaterUpdated);
     }
@@ -578,7 +617,20 @@ async fn update_process(
         progress_state.clone(),
         RemoteFilePass::update(),
     )
-    .await?;
+    .await
+    .context(ErrorCode::CheckForUpdates.to_string())?;
+
+    // Set execute permission on the game executable for Unix platforms
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe_path = args.output.join(&args.exe);
+        if exe_path.exists() {
+            let perms = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(&exe_path, perms)
+                .context("Failed to set execute permission on game executable")?;
+        }
+    }
 
     // Verify all files after update
     let all_files = build_full_file_list(&remote_manifest);
@@ -589,7 +641,8 @@ async fn update_process(
         progress_state,
         RemoteFilePass::verify(),
     )
-    .await?;
+    .await
+    .context(ErrorCode::CheckForUpdates.to_string())?;
 
     if files_repaired > 0 {
         info!(
@@ -609,7 +662,7 @@ async fn update_process(
 enum Message {
     Launch,
     Shutdown,
-    Error(String),
+    Error { message: String, details: String },
     VerifyStarted,
     VerifyComplete { repaired: usize },
     VerifyCancelled,
@@ -707,18 +760,32 @@ async fn main() -> anyhow::Result<()> {
 
     // Create the webview
     let webview = fltk_webview::Webview::create(false, &mut webview_win);
-    webview.bind("open_url", |_, content| {
-        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+    if let Err(e) = webview.bind("open_url", |_, content| {
+        let parsed: serde_json::Value = match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to parse webview callback data: {}", e);
+                return;
+            }
+        };
 
         // Open the url in the native browser
         let url = parsed.get(0).and_then(|url_param| url_param.as_str());
         if let Some(url) = url {
             info!("Opening url in native browser: {}", url);
-            open::that(url).unwrap();
+            if let Err(e) = open::that(url) {
+                error!("Failed to open URL in browser: {}", e);
+            }
         }
-    });
-    webview.init(script);
-    webview.navigate("https://roseonlinegame.com/launcher.html");
+    }) {
+        error!("Failed to bind webview callback: {}", e);
+    }
+    if let Err(e) = webview.init(script) {
+        error!("Failed to initialize webview: {}", e);
+    }
+    if let Err(e) = webview.navigate("https://roseonlinegame.com/launcher.html") {
+        error!("Failed to navigate webview: {}", e);
+    }
 
     // general channel
     let (app_message_sender, app_message_receiver) = app::channel::<Message>();
@@ -753,7 +820,7 @@ async fn main() -> anyhow::Result<()> {
 
         let exe = exe_dir.join(&exe);
 
-        process::Command::new(&exe)
+        match process::Command::new(&exe)
             .current_dir(&exe_dir)
             .args(&exe_args)
             // Don't share handles so child process can exit cleanly
@@ -761,9 +828,24 @@ async fn main() -> anyhow::Result<()> {
             .stdout(process::Stdio::null())
             .stderr(process::Stdio::null())
             .spawn()
-            .unwrap();
-
-        app.quit();
+        {
+            Ok(_) => {
+                app.quit();
+            }
+            Err(e) => {
+                error!("Failed to launch game: {}", e);
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Launch Error")
+                    .set_description(format!(
+                        "{}\n\nMake sure '{}' exists in the game folder.\n\nDetails: {}",
+                        ErrorCode::LaunchGame,
+                        exe.display(),
+                        e
+                    ))
+                    .show();
+            }
+        }
     });
 
     // Verify button callback
@@ -876,7 +958,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         error!("Verification failed: {}", e);
-                        app_message_sender.send(Message::Error(e.to_string()));
+                        app_message_sender.send(Message::Error {
+                            message: e.to_string(),
+                            details: format!("{:#}", e),
+                        });
                     }
                 }
                 return;
@@ -905,9 +990,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                let error_string = result.err().unwrap().to_string();
-                error!("Download task failed or cancelled, error {}", &error_string);
-                app_message_sender.send(Message::Error(error_string));
+                let err = result.err().unwrap();
+                let message = err.to_string();
+                let details = format!("{:#}", err);
+                error!("Download task failed or cancelled: {}", &details);
+                app_message_sender.send(Message::Error { message, details });
             }
         })
     };
@@ -923,15 +1010,16 @@ async fn main() -> anyhow::Result<()> {
                     info!("Shutting down");
                     break;
                 }
-                Message::Error(e) => {
-                    dialog::alert(
-                        (app::screen_size().0 / 2.0) as i32,
-                        (app::screen_size().0 / 2.0) as i32,
-                        &format!(
-                            "An error was detected, please restart the launcher:\nError: {}",
-                            e
-                        ),
-                    );
+                Message::Error { message, details } => {
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Update Error")
+                        .set_description(format!(
+                            "{}\n\nIf this keeps happening, check your internet connection or try again later.\n\nDetails: {}",
+                            message,
+                            details
+                        ))
+                        .show();
                     break;
                 }
                 Message::VerifyStarted => {
@@ -1009,19 +1097,20 @@ fn setup_logging(
     level: tracing::Level,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     let Some(project_dirs) = ProjectDirs::from("com", "Rednim Games", "ROSE Online") else {
-        anyhow::bail!("Failed to get project dirs");
+        anyhow::bail!("{}", ErrorCode::InitLogging);
     };
 
     let log_file_path = project_dirs.data_local_dir().join("rose-updater.log");
     if let Some(log_file_dir) = log_file_path.parent() {
-        std::fs::create_dir_all(log_file_dir)?;
+        std::fs::create_dir_all(log_file_dir).context(ErrorCode::InitLogging.to_string())?;
     }
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(log_file_path)?;
+        .open(log_file_path)
+        .context(ErrorCode::InitLogging.to_string())?;
 
     let env_filter = format!("{},hyper=info,mio=info", level);
     let (non_blocking_file_appender, log_guard) = tracing_appender::non_blocking(log_file);
@@ -1048,7 +1137,8 @@ fn setup_logging(
         .with(stdout_layer)
         .with(file_layer);
 
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set default subscriber");
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| anyhow::anyhow!("{}: {}", ErrorCode::InitLogging, e))?;
 
     Ok(log_guard)
 }
