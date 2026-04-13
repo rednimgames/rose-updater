@@ -463,7 +463,7 @@ mod windows_spawn_tests {
         );
         assert_ne!(
             io::Error::from_raw_os_error(5).raw_os_error(),
-            ERROR_ELEVATION_REQUIRED.0 as i32
+            Some(ERROR_ELEVATION_REQUIRED.0 as i32)
         );
     }
 }
