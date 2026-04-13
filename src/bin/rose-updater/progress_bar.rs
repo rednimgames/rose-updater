@@ -10,6 +10,31 @@ use humansize::{format_size, DECIMAL};
 
 use crate::ProgressStage;
 
+fn progress_message(stage: ProgressStage, value: usize, max: usize) -> String {
+    match stage {
+        ProgressStage::FetchingMetadata => "Fetching metadata".into(),
+        ProgressStage::UpdatingUpdater => {
+            format!(
+                "Updating updater - {} / {}",
+                format_size(value, DECIMAL),
+                format_size(max, DECIMAL)
+            )
+        }
+        ProgressStage::CheckingFiles => {
+            format!("Checking local files - {} / {}", value, max)
+        }
+        ProgressStage::DownloadingUpdates => {
+            format!(
+                "Downloading updates - {} / {}",
+                format_size(value, DECIMAL),
+                format_size(max, DECIMAL)
+            )
+        }
+        ProgressStage::VerifyingFiles => "Verifying / repairing files".into(),
+        _ => "".into(),
+    }
+}
+
 pub struct ProgressBar {
     bar: Frame,
     min: Arc<AtomicUsize>,
@@ -97,30 +122,7 @@ impl ProgressBar {
                     );
                 }
 
-                let message = match stage {
-                    ProgressStage::FetchingMetadata => "Fetching metadata".into(),
-                    ProgressStage::UpdatingUpdater => {
-                        format!(
-                            "Updating updater - {} / {}",
-                            format_size(value, DECIMAL),
-                            format_size(max, DECIMAL)
-                        )
-                    }
-                    ProgressStage::CheckingFiles => {
-                        format!("Checking local files - {} / {}", value, max)
-                    }
-                    ProgressStage::DownloadingUpdates => {
-                        format!(
-                            "Downloading Updates - {} / {}",
-                            format_size(value, DECIMAL),
-                            format_size(max, DECIMAL)
-                        )
-                    }
-                    ProgressStage::VerifyingFiles => {
-                        format!("Verifying files - {} / {}", value, max)
-                    }
-                    _ => "".into(),
-                };
+                let message = progress_message(stage, value, max);
 
                 draw::set_font(Font::Helvetica, 12);
                 let mut size = draw::width(&message) as i32;
@@ -204,5 +206,18 @@ impl Deref for ProgressBar {
 impl DerefMut for ProgressBar {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.bar
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_stage_uses_verify_repair_copy() {
+        assert_eq!(
+            progress_message(ProgressStage::VerifyingFiles, 12, 24),
+            "Verifying / repairing files"
+        );
     }
 }

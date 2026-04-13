@@ -168,6 +168,43 @@ struct FileToDownload {
     remote_path: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RemoteFilePass {
+    scan_stage: ProgressStage,
+    transfer_stage: ProgressStage,
+    delete_text_files: bool,
+}
+
+impl RemoteFilePass {
+    const fn update() -> Self {
+        Self {
+            scan_stage: ProgressStage::CheckingFiles,
+            transfer_stage: ProgressStage::DownloadingUpdates,
+            delete_text_files: true,
+        }
+    }
+
+    const fn verify() -> Self {
+        Self {
+            scan_stage: ProgressStage::VerifyingFiles,
+            transfer_stage: ProgressStage::VerifyingFiles,
+            delete_text_files: false,
+        }
+    }
+}
+
+fn is_text_file_path(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+        return false;
+    };
+
+    TEXT_FILE_EXTENSIONS.contains(&ext)
+}
+
+fn should_remove_text_file(pass: RemoteFilePass, path: &Path) -> bool {
+    pass.delete_text_files && is_text_file_path(path)
+}
+
 /// Check which files need to be updated by comparing our local manifest to the remote manifest
 async fn get_files_to_update(
     output_dir: &Path,
@@ -209,6 +246,7 @@ async fn get_remote_files(
     files_to_update: &[FileToDownload],
     output_dir: &Path,
     progress_state: ProgressState,
+    pass: RemoteFilePass,
 ) -> anyhow::Result<usize> {
     info!(count = files_to_update.len(), "Starting clone process");
 
@@ -239,15 +277,7 @@ async fn get_remote_files(
     // has changed, we delete it first so bitar will just redownload the
     // whole file.
     for path in &local_file_paths {
-        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-            continue;
-        };
-
-        if !TEXT_FILE_EXTENSIONS.contains(&ext) {
-            continue;
-        }
-
-        if !path.exists() {
+        if !path.exists() || !should_remove_text_file(pass, path) {
             continue;
         }
 
@@ -271,7 +301,7 @@ async fn get_remote_files(
         "Building local chunk indexes"
     );
 
-    progress_state.set_stage(ProgressStage::CheckingFiles);
+    progress_state.set_stage(pass.scan_stage);
     progress_state.set_current_progress(0);
     progress_state.set_max_progress(total_local_chunk_count);
 
@@ -338,7 +368,7 @@ async fn get_remote_files(
         "Downloading missing chunks"
     );
 
-    progress_state.set_stage(ProgressStage::DownloadingUpdates);
+    progress_state.set_stage(pass.transfer_stage);
     progress_state.set_current_progress(0);
     progress_state.set_max_progress(total_download_chunk_size as u64);
 
@@ -391,10 +421,14 @@ async fn verify_and_repair(
 
     info!(count = all_files.len(), "Starting verification");
 
-    progress_state.set_stage(ProgressStage::VerifyingFiles);
-
-    let files_repaired =
-        get_remote_files(remote_url, &all_files, output_dir, progress_state).await?;
+    let files_repaired = get_remote_files(
+        remote_url,
+        &all_files,
+        output_dir,
+        progress_state,
+        RemoteFilePass::verify(),
+    )
+    .await?;
 
     // Update local manifest to match remote after verification
     let local_manifest = get_or_create_local_manifest(local_manifest_path).await?;
@@ -506,16 +540,31 @@ async fn update_process(
         get_files_to_update(&args.output, &remote_manifest, &local_manifest).await
     };
 
-    get_remote_files(&remote_url, &files_to_update, &args.output, progress_state.clone()).await?;
+    get_remote_files(
+        &remote_url,
+        &files_to_update,
+        &args.output,
+        progress_state.clone(),
+        RemoteFilePass::update(),
+    )
+    .await?;
 
     // Verify all files after update
-    progress_state.set_stage(ProgressStage::VerifyingFiles);
     let all_files = build_full_file_list(&remote_manifest);
-    let files_repaired =
-        get_remote_files(&remote_url, &all_files, &args.output, progress_state).await?;
+    let files_repaired = get_remote_files(
+        &remote_url,
+        &all_files,
+        &args.output,
+        progress_state,
+        RemoteFilePass::verify(),
+    )
+    .await?;
 
     if files_repaired > 0 {
-        info!(files_repaired, "Repaired files during post-update verification");
+        info!(
+            files_repaired,
+            "Repaired files during post-update verification"
+        );
     }
 
     let mut new_local_manifest = LocalManifest {
@@ -545,6 +594,24 @@ enum Message {
     VerifyStarted,
     VerifyComplete { repaired: usize },
     VerifyCancelled,
+    VerifyFailed(String),
+}
+
+fn restore_ready_state(
+    launch_button: &mut launch_button::LaunchButton,
+    verify_button: &mut button::Button,
+    progress_state: &ProgressState,
+) {
+    launch_button.activate();
+    launch_button.change_state(launch_button::LaunchButtonState::Play);
+    launch_button.redraw();
+
+    verify_button.set_label("Verify");
+    verify_button.activate();
+    verify_button.show();
+    verify_button.redraw();
+
+    progress_state.set_stage(ProgressStage::Play);
 }
 
 #[tokio::main]
@@ -729,8 +796,10 @@ async fn main() -> anyhow::Result<()> {
                 let remote_url = match Url::parse(&verify_url) {
                     Ok(url) => url,
                     Err(e) => {
+                        let mut guard = cancel_tx_clone.lock().await;
+                        *guard = None;
                         app_message_sender
-                            .send(Message::Error(format!("Failed to parse URL: {}", e)));
+                            .send(Message::VerifyFailed(format!("Failed to parse URL: {}", e)));
                         return;
                     }
                 };
@@ -771,7 +840,7 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => {
                         error!("Verification failed: {}", e);
                         app_message_sender
-                            .send(Message::Error(format!("Verification failed: {}", e)));
+                            .send(Message::VerifyFailed(format!("Verification failed: {}", e)));
                     }
                 }
             });
@@ -793,7 +862,8 @@ async fn main() -> anyhow::Result<()> {
                 let remote_url = match Url::parse(&verify_url_for_task) {
                     Ok(url) => url,
                     Err(e) => {
-                        app_message_sender.send(Message::Error(format!("Failed to parse URL: {}", e)));
+                        app_message_sender
+                            .send(Message::Error(format!("Failed to parse URL: {}", e)));
                         return;
                     }
                 };
@@ -861,14 +931,7 @@ async fn main() -> anyhow::Result<()> {
             match e {
                 Message::Launch => {
                     info!("Ready to launch");
-                    launch_button.activate();
-                    launch_button.change_state(launch_button::LaunchButtonState::Play);
-                    launch_button.redraw();
-                    verify_button.set_label("Verify");
-                    verify_button.activate();
-                    verify_button.show();
-                    verify_button.redraw();
-                    progress_state.set_stage(ProgressStage::Play);
+                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
                 }
                 Message::Shutdown => {
                     info!("Shutting down");
@@ -891,12 +954,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Message::VerifyComplete { repaired } => {
                     info!(repaired, "Verification complete");
-                    launch_button.activate();
-                    launch_button.redraw();
-                    verify_button.set_label("Verify");
-                    verify_button.activate();
-                    verify_button.redraw();
-                    progress_state.set_stage(ProgressStage::Play);
+                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
 
                     let message = if repaired == 0 {
                         "All files verified successfully".to_string()
@@ -912,12 +970,16 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Message::VerifyCancelled => {
                     info!("Verification cancelled");
-                    launch_button.activate();
-                    launch_button.redraw();
-                    verify_button.set_label("Verify");
-                    verify_button.activate();
-                    verify_button.redraw();
-                    progress_state.set_stage(ProgressStage::Play);
+                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
+                }
+                Message::VerifyFailed(e) => {
+                    error!("Manual verification failed: {}", e);
+                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("Verification Error")
+                        .set_description(&e)
+                        .show();
                 }
             }
         }
@@ -1003,4 +1065,37 @@ fn setup_logging(
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set default subscriber");
 
     Ok(log_guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_pass_uses_update_stages_and_text_workaround() {
+        let pass = RemoteFilePass::update();
+
+        assert_eq!(pass.scan_stage, ProgressStage::CheckingFiles);
+        assert_eq!(pass.transfer_stage, ProgressStage::DownloadingUpdates);
+        assert!(pass.delete_text_files);
+    }
+
+    #[test]
+    fn verify_pass_keeps_verify_stage_without_text_workaround() {
+        let pass = RemoteFilePass::verify();
+
+        assert_eq!(pass.scan_stage, ProgressStage::VerifyingFiles);
+        assert_eq!(pass.transfer_stage, ProgressStage::VerifyingFiles);
+        assert!(!pass.delete_text_files);
+    }
+
+    #[test]
+    fn only_update_pass_removes_xml_files() {
+        let xml_path = Path::new("data.xml");
+        let bin_path = Path::new("data.stb");
+
+        assert!(should_remove_text_file(RemoteFilePass::update(), xml_path));
+        assert!(!should_remove_text_file(RemoteFilePass::verify(), xml_path));
+        assert!(!should_remove_text_file(RemoteFilePass::update(), bin_path));
+    }
 }
