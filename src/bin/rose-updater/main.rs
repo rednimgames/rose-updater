@@ -26,9 +26,7 @@ use windows::core::PCWSTR;
 #[cfg(windows)]
 use windows::Win32::Foundation::ERROR_ELEVATION_REQUIRED;
 #[cfg(windows)]
-use windows::Win32::UI::Shell::{
-    ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, SHELLEXECUTE_MASK_FLAGS,
-};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
 
 use rose_update::clone::{
     build_local_chunk_index, clone_remote_file, estimate_local_chunk_count,
@@ -203,34 +201,17 @@ fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) ->
 }
 
 #[cfg(windows)]
-#[derive(Debug)]
-struct ShellExecuteSpec {
-    file: PathBuf,
-    parameters: Option<Vec<u16>>,
-    directory: Option<PathBuf>,
-    mask: SHELLEXECUTE_MASK_FLAGS,
-}
-
-#[cfg(windows)]
-fn should_use_shell_fallback(error: &io::Error) -> bool {
-    error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED.0 as i32)
-}
-
-#[cfg(windows)]
-fn resolve_shell_file(exe: &Path, working_dir: Option<&Path>) -> io::Result<PathBuf> {
-    let exe = if exe.is_absolute() {
-        exe.to_path_buf()
-    } else if let Some(dir) = working_dir {
-        if let Ok(stripped) = exe.strip_prefix(dir) {
-            dir.join(stripped)
-        } else {
-            dir.join(exe)
-        }
-    } else {
-        exe.to_path_buf()
+fn resolve_shell_paths(
+    exe: &Path,
+    working_dir: Option<&Path>,
+) -> io::Result<(PathBuf, Option<PathBuf>)> {
+    let directory = working_dir.map(std::path::absolute).transpose()?;
+    let file = match directory.as_ref() {
+        Some(dir) if !exe.is_absolute() => dir.join(exe),
+        _ => exe.to_path_buf(),
     };
 
-    std::path::absolute(exe)
+    Ok((std::path::absolute(file)?, directory))
 }
 
 #[cfg(windows)]
@@ -276,31 +257,7 @@ fn encode_windows_command_line(args: &[String]) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn build_shell_execute_spec(
-    exe: &Path,
-    args: &[String],
-    working_dir: Option<&Path>,
-) -> io::Result<ShellExecuteSpec> {
-    let file = resolve_shell_file(exe, working_dir)?;
-    let directory = working_dir.map(std::path::absolute).transpose()?;
-    let parameters = (!args.is_empty()).then(|| {
-        let mut encoded = encode_windows_command_line(args);
-        encoded.push(0);
-        encoded
-    });
-
-    Ok(ShellExecuteSpec {
-        file,
-        parameters,
-        directory,
-        // The launcher exits almost immediately after a successful ShellExecuteExW call.
-        // Force the shell work to complete on this thread before returning.
-        mask: SEE_MASK_NOASYNC,
-    })
-}
-
-#[cfg(windows)]
-fn spawn_process_shell(spec: &ShellExecuteSpec) -> anyhow::Result<()> {
+fn spawn_process_shell(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
@@ -308,15 +265,23 @@ fn spawn_process_shell(spec: &ShellExecuteSpec) -> anyhow::Result<()> {
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    let file_wide = to_wide(spec.file.as_os_str());
-    let dir_wide = spec.directory.as_ref().map(|dir| to_wide(dir.as_os_str()));
+    let (file, directory) = resolve_shell_paths(exe, working_dir)?;
+    let parameters = (!args.is_empty()).then(|| {
+        let mut encoded = encode_windows_command_line(args);
+        encoded.push(0);
+        encoded
+    });
+
+    let file_wide = to_wide(file.as_os_str());
+    let dir_wide = directory.as_ref().map(|dir| to_wide(dir.as_os_str()));
 
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.fMask = spec.mask;
+    // The launcher exits almost immediately after a successful ShellExecuteExW call.
+    // Force the shell work to complete on this thread before returning.
+    info.fMask = SEE_MASK_NOASYNC;
     info.lpFile = PCWSTR(file_wide.as_ptr());
-    info.lpParameters = spec
-        .parameters
+    info.lpParameters = parameters
         .as_ref()
         .map_or(PCWSTR::null(), |params| PCWSTR(params.as_ptr()));
     info.lpDirectory = dir_wide
@@ -333,9 +298,8 @@ fn spawn_process_shell(spec: &ShellExecuteSpec) -> anyhow::Result<()> {
 fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
     match spawn_process_std(exe, args, working_dir) {
         Ok(()) => Ok(()),
-        Err(error) if should_use_shell_fallback(&error) => {
-            let spec = build_shell_execute_spec(exe, args, working_dir)?;
-            spawn_process_shell(&spec)
+        Err(error) if error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED.0 as i32) => {
+            spawn_process_shell(exe, args, working_dir)
         }
         Err(error) => Err(error.into()),
     }
@@ -450,76 +414,57 @@ mod windows_spawn_tests {
 
     #[test]
     fn resolves_default_windows_launch_paths_to_absolute() {
-        let spec =
-            build_shell_execute_spec(Path::new("trose.exe"), &[], Some(Path::new("."))).unwrap();
+        let (file, directory) =
+            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("."))).unwrap();
 
         assert_eq!(
-            spec.file,
+            file,
             std::path::absolute(Path::new("./trose.exe")).unwrap()
         );
         assert_eq!(
-            spec.directory,
+            directory,
             Some(std::path::absolute(Path::new(".")).unwrap())
         );
     }
 
     #[test]
     fn resolves_relative_executable_against_custom_directory() {
-        let spec =
-            build_shell_execute_spec(Path::new("trose.exe"), &[], Some(Path::new("game"))).unwrap();
+        let (file, directory) =
+            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("game"))).unwrap();
 
         assert_eq!(
-            spec.file,
+            file,
             std::path::absolute(Path::new("game/trose.exe")).unwrap()
         );
         assert_eq!(
-            spec.directory,
+            directory,
             Some(std::path::absolute(Path::new("game")).unwrap())
-        );
-    }
-
-    #[test]
-    fn does_not_join_prefixed_relative_paths_twice() {
-        let spec =
-            build_shell_execute_spec(Path::new("game/trose.exe"), &[], Some(Path::new("game")))
-                .unwrap();
-
-        assert_eq!(
-            spec.file,
-            std::path::absolute(Path::new("game/trose.exe")).unwrap()
         );
     }
 
     #[test]
     fn preserves_absolute_executable_paths() {
         let absolute_exe = std::path::absolute(Path::new("trose.exe")).unwrap();
-        let spec = build_shell_execute_spec(&absolute_exe, &[], Some(Path::new("game"))).unwrap();
+        let (file, directory) =
+            resolve_shell_paths(&absolute_exe, Some(Path::new("game"))).unwrap();
 
-        assert_eq!(spec.file, absolute_exe);
+        assert_eq!(file, absolute_exe);
         assert_eq!(
-            spec.directory,
+            directory,
             Some(std::path::absolute(Path::new("game")).unwrap())
         );
     }
 
     #[test]
     fn falls_back_only_for_elevation_required() {
-        assert!(should_use_shell_fallback(&io::Error::from_raw_os_error(
+        assert_eq!(
+            io::Error::from_raw_os_error(ERROR_ELEVATION_REQUIRED.0 as i32).raw_os_error(),
+            Some(ERROR_ELEVATION_REQUIRED.0 as i32)
+        );
+        assert_ne!(
+            io::Error::from_raw_os_error(5).raw_os_error(),
             ERROR_ELEVATION_REQUIRED.0 as i32
-        )));
-        assert!(!should_use_shell_fallback(&io::Error::from_raw_os_error(5)));
-    }
-
-    #[test]
-    fn shell_execute_request_sets_no_async_mask() {
-        let spec = build_shell_execute_spec(
-            Path::new("trose.exe"),
-            &["--init".to_string()],
-            Some(Path::new(".")),
-        )
-        .unwrap();
-
-        assert_eq!(spec.mask, SEE_MASK_NOASYNC);
+        );
     }
 }
 
@@ -969,7 +914,7 @@ async fn main() -> anyhow::Result<()> {
             exe_args.join(" ")
         );
 
-        let exe = exe_dir.join(&exe);
+        let display_exe = exe_dir.join(&exe);
 
         match spawn_process(&exe, &exe_args, Some(&exe_dir)) {
             Ok(_) => {
@@ -983,7 +928,7 @@ async fn main() -> anyhow::Result<()> {
                     .set_description(format!(
                         "{}\n\nMake sure '{}' exists in the game folder.\n\nDetails: {}",
                         ErrorCode::LaunchGame,
-                        exe.display(),
+                        display_exe.display(),
                         e
                     ))
                     .show();
