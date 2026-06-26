@@ -7,6 +7,7 @@ fn main() -> io::Result<()> {
     {
         WindowsResource::new()
             .set_icon("res/client.ico")
+            .set_manifest_file("res/app.manifest")
             .compile()?;
     }
     Ok(())
