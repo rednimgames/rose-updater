@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -21,6 +22,12 @@ use tokio::fs;
 use tracing::{error, info, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::Foundation::ERROR_ELEVATION_REQUIRED;
+#[cfg(windows)]
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
 
 use rose_update::clone::{
     build_local_chunk_index, clone_remote_file, estimate_local_chunk_count,
@@ -179,6 +186,287 @@ async fn update_updater(
     );
 
     Ok(())
+}
+
+fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) -> io::Result<()> {
+    let mut cmd = process::Command::new(exe);
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    cmd.args(args)
+        .stdin(process::Stdio::null())
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_shell_paths(
+    exe: &Path,
+    working_dir: Option<&Path>,
+) -> io::Result<(PathBuf, Option<PathBuf>)> {
+    let directory = working_dir.map(std::path::absolute).transpose()?;
+    let file = match directory.as_ref() {
+        Some(dir) if !exe.is_absolute() => dir.join(exe),
+        _ => exe.to_path_buf(),
+    };
+
+    Ok((std::path::absolute(file)?, directory))
+}
+
+#[cfg(windows)]
+fn append_windows_arg(cmd: &mut Vec<u16>, arg: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes = arg.as_bytes();
+    let quote = bytes.iter().any(|byte| matches!(*byte, b' ' | b'\t')) || bytes.is_empty();
+    if quote {
+        cmd.push('"' as u16);
+    }
+
+    let mut backslashes = 0usize;
+    for code_unit in OsStr::new(arg).encode_wide() {
+        if code_unit == '\\' as u16 {
+            backslashes += 1;
+        } else {
+            if code_unit == '"' as u16 {
+                cmd.extend((0..=backslashes).map(|_| '\\' as u16));
+            }
+            backslashes = 0;
+        }
+        cmd.push(code_unit);
+    }
+
+    if quote {
+        cmd.extend((0..backslashes).map(|_| '\\' as u16));
+        cmd.push('"' as u16);
+    }
+}
+
+#[cfg(windows)]
+fn encode_windows_command_line(args: &[String]) -> Vec<u16> {
+    let mut command_line = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            command_line.push(' ' as u16);
+        }
+        append_windows_arg(&mut command_line, arg);
+    }
+    command_line
+}
+
+#[cfg(windows)]
+fn spawn_process_shell(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    fn to_wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let (file, directory) = resolve_shell_paths(exe, working_dir)?;
+    let parameters = (!args.is_empty()).then(|| {
+        let mut encoded = encode_windows_command_line(args);
+        encoded.push(0);
+        encoded
+    });
+
+    let file_wide = to_wide(file.as_os_str());
+    let dir_wide = directory.as_ref().map(|dir| to_wide(dir.as_os_str()));
+
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    // The launcher exits almost immediately after a successful ShellExecuteExW call.
+    // Force the shell work to complete on this thread before returning.
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpFile = PCWSTR(file_wide.as_ptr());
+    info.lpParameters = parameters
+        .as_ref()
+        .map_or(PCWSTR::null(), |params| PCWSTR(params.as_ptr()));
+    info.lpDirectory = dir_wide
+        .as_ref()
+        .map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr()));
+    info.nShow = 1; // SW_SHOWNORMAL
+
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|error| anyhow::anyhow!("{}", error))
+}
+
+/// Spawn a detached process. On Windows, try the standard library's CreateProcess path first
+/// and only fall back to ShellExecuteExW for executables that require elevation.
+#[cfg(windows)]
+fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    match spawn_process_std(exe, args, working_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED.0 as i32) => {
+            spawn_process_shell(exe, args, working_dir)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
+    spawn_process_std(exe, args, working_dir)?;
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_spawn_tests {
+    use super::*;
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn CommandLineToArgvW(command_line: *const u16, argc: *mut i32) -> *mut *mut u16;
+    }
+
+    fn parse_command_line(command_line: &[u16]) -> Vec<String> {
+        let mut argc = 0;
+        let argv = unsafe { CommandLineToArgvW(command_line.as_ptr(), &mut argc) };
+        assert!(!argv.is_null(), "CommandLineToArgvW failed");
+
+        let args = unsafe {
+            (0..argc as usize)
+                .map(|index| {
+                    let arg = *argv.add(index);
+                    let mut len = 0usize;
+                    while *arg.add(len) != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16(std::slice::from_raw_parts(arg, len)).unwrap()
+                })
+                .collect()
+        };
+
+        unsafe {
+            let _ = LocalFree(argv.cast());
+        }
+
+        args
+    }
+
+    fn round_trip_shell_args(args: &[String]) -> Vec<String> {
+        let mut command_line: Vec<u16> = "launcher.exe".encode_utf16().collect();
+        let encoded_args = encode_windows_command_line(args);
+        if !encoded_args.is_empty() {
+            command_line.push(' ' as u16);
+            command_line.extend_from_slice(&encoded_args);
+        }
+        command_line.push(0);
+        parse_command_line(&command_line)
+            .into_iter()
+            .skip(1)
+            .collect()
+    }
+
+    #[test]
+    fn preserves_single_trailing_backslash() {
+        let args = vec![r"C:\Program Files\Rose\".to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_multiple_trailing_backslashes() {
+        let args = vec![r"C:\Program Files\Rose\\".to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_embedded_quotes() {
+        let args = vec![r#"has\"quote"#.to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_backslashes_before_quote() {
+        let args = vec![r#"a\\\"b c"#.to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_empty_arguments() {
+        let args = vec![String::new()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_tab_arguments() {
+        let args = vec!["a\tb".to_string()];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn preserves_multi_argument_command_lines() {
+        let args = vec![
+            "--init".to_string(),
+            "--server".to_string(),
+            "connect.roseonlinegame.com".to_string(),
+            r"C:\Program Files\Rose\".to_string(),
+        ];
+        assert_eq!(round_trip_shell_args(&args), args);
+    }
+
+    #[test]
+    fn resolves_default_windows_launch_paths_to_absolute() {
+        let (file, directory) =
+            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("."))).unwrap();
+
+        assert_eq!(
+            file,
+            std::path::absolute(Path::new("./trose.exe")).unwrap()
+        );
+        assert_eq!(
+            directory,
+            Some(std::path::absolute(Path::new(".")).unwrap())
+        );
+    }
+
+    #[test]
+    fn resolves_relative_executable_against_custom_directory() {
+        let (file, directory) =
+            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("game"))).unwrap();
+
+        assert_eq!(
+            file,
+            std::path::absolute(Path::new("game/trose.exe")).unwrap()
+        );
+        assert_eq!(
+            directory,
+            Some(std::path::absolute(Path::new("game")).unwrap())
+        );
+    }
+
+    #[test]
+    fn preserves_absolute_executable_paths() {
+        let absolute_exe = std::path::absolute(Path::new("trose.exe")).unwrap();
+        let (file, directory) =
+            resolve_shell_paths(&absolute_exe, Some(Path::new("game"))).unwrap();
+
+        assert_eq!(file, absolute_exe);
+        assert_eq!(
+            directory,
+            Some(std::path::absolute(Path::new("game")).unwrap())
+        );
+    }
+
+    #[test]
+    fn falls_back_only_for_elevation_required() {
+        assert_eq!(
+            io::Error::from_raw_os_error(ERROR_ELEVATION_REQUIRED.0 as i32).raw_os_error(),
+            Some(ERROR_ELEVATION_REQUIRED.0 as i32)
+        );
+        assert_ne!(
+            io::Error::from_raw_os_error(5).raw_os_error(),
+            Some(ERROR_ELEVATION_REQUIRED.0 as i32)
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -622,18 +910,12 @@ async fn update_process(
         info!("Restarting updater");
         let current_exe =
             env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
-        process::Command::new(current_exe)
-            .args(
-                env::args()
-                    .skip(1)
-                    // Prevent infinite loop of update rechecks by removing the forced updater check
-                    .filter(|arg| !arg.contains("force-recheck-updater")),
-            )
-            // Don't share handles so child process can exit cleanly
-            .stdin(process::Stdio::null())
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .spawn()
+        let restart_args: Vec<String> = env::args()
+            .skip(1)
+            // Prevent infinite loop of update rechecks by removing the forced updater check
+            .filter(|arg| !arg.contains("force-recheck-updater"))
+            .collect();
+        spawn_process(&current_exe, &restart_args, None)
             .context(ErrorCode::RestartLauncher.to_string())?;
 
         return Ok(UpdateProcessResult::UpdaterUpdated);
@@ -853,17 +1135,9 @@ async fn main() -> anyhow::Result<()> {
             exe_args.join(" ")
         );
 
-        let exe = exe_dir.join(&exe);
+        let display_exe = exe_dir.join(&exe);
 
-        match process::Command::new(&exe)
-            .current_dir(&exe_dir)
-            .args(&exe_args)
-            // Don't share handles so child process can exit cleanly
-            .stdin(process::Stdio::null())
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null())
-            .spawn()
-        {
+        match spawn_process(&exe, &exe_args, Some(&exe_dir)) {
             Ok(_) => {
                 app.quit();
             }
@@ -875,7 +1149,7 @@ async fn main() -> anyhow::Result<()> {
                     .set_description(format!(
                         "{}\n\nMake sure '{}' exists in the game folder.\n\nDetails: {}",
                         ErrorCode::LaunchGame,
-                        exe.display(),
+                        display_exe.display(),
                         e
                     ))
                     .show();

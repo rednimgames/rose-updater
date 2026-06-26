@@ -1844,7 +1844,11 @@ dependencies = [
 
 [[package]]
 name = "rose_update"
+<<<<<<< l3nn0x/verify-repair
 version = "0.3.6"
+=======
+version = "0.3.5"
+>>>>>>> main
 dependencies = [
  "anyhow",
  "bitar",
