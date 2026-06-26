@@ -469,6 +469,41 @@ async fn get_remote_files(
         clone_results?;
     }
 
+    // bitar's CloneOutput writes chunks by offset but never shrinks the output
+    // file. If a local file is larger than the remote source (e.g. left over
+    // from an older version with a bigger file), the stale tail bytes remain.
+    // With fixed-size chunking those extra bytes shift the final chunk
+    // boundary, so the remote's last (partial) chunk is never found locally and
+    // gets re-downloaded on every verify, never converging. Truncate each file
+    // down to the remote source size so it matches and subsequent passes are
+    // clean.
+    for (archive_reader, local_file_path) in archive_readers.iter().zip(&local_file_paths) {
+        let source_size = archive_reader.total_source_size();
+        match fs::metadata(local_file_path).await {
+            Ok(metadata) if metadata.len() > source_size => {
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .open(local_file_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{} ({})",
+                            ErrorCode::OpenFileForWriting,
+                            local_file_path.display()
+                        )
+                    })?;
+                file.set_len(source_size).await.with_context(|| {
+                    format!(
+                        "{} ({})",
+                        ErrorCode::WriteUpdateToDisk,
+                        local_file_path.display()
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+
     Ok(files_repaired)
 }
 
