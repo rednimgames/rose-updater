@@ -37,12 +37,14 @@
 //! remote archive chunk by chunk, completing the cloning process.
 //!
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::Context;
 use bitar::CloneOutput;
 use futures::StreamExt;
 
 use tokio::fs;
+use tokio::sync::Semaphore;
 
 use crate::{dns::CloudflareResolver, error::ErrorCode, progress::ProgressState};
 
@@ -50,6 +52,24 @@ pub type RemoteArchiveReader = bitar::Archive<bitar::archive_reader::HttpReader>
 
 const LOCAL_CHUNK_BUFFER_SIZE: usize = 64;
 const REMOTE_CHUNK_BUFFER_SIZE: usize = 64;
+
+/// Bounds the number of chunks being hashed/decompressed concurrently across
+/// the entire process. Chunk verification and decompression are CPU-bound, and
+/// both the local-scan and download stages fan out across every file at once
+/// (each with its own buffered pipeline), which otherwise oversubscribes the
+/// CPU. Sharing one semaphore keeps total CPU usage bounded regardless of how
+/// many files are being processed.
+fn cpu_semaphore() -> &'static Semaphore {
+    static SEM: OnceLock<Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        // Leave headroom so the UI and I/O stay responsive during a verify.
+        let permits = (cores / 2).max(2);
+        Semaphore::new(permits)
+    })
+}
 
 /// Initiates a bitar archive reader for reading a remote archive over HTTP
 pub async fn init_remote_archive_reader(url: reqwest::Url) -> anyhow::Result<RemoteArchiveReader> {
@@ -133,10 +153,14 @@ pub async fn build_local_chunk_index(
 
     let mut chunk_stream = chunker_config
         .new_chunker(&mut local_file)
-        .map(|stream_chunk| {
+        .map(|stream_chunk| async move {
+            // Hold a permit for the duration of the (CPU-bound) hashing so we
+            // don't saturate every core when many files are scanned at once.
+            let _permit = cpu_semaphore().acquire().await;
             tokio::task::spawn_blocking(|| {
                 stream_chunk.map(|(offset, chunk)| (offset, chunk.verify()))
             })
+            .await
         })
         .buffered(LOCAL_CHUNK_BUFFER_SIZE);
 
@@ -208,7 +232,10 @@ pub async fn clone_remote_file(
 
     let mut chunk_stream = archive_reader
         .chunk_stream(clone_output.chunks())
-        .map(|archive_chunk| {
+        .map(|archive_chunk| async move {
+            // Hold a permit for the duration of the (CPU-bound) decompress +
+            // verify so parallel file clones don't oversubscribe the CPU.
+            let _permit = cpu_semaphore().acquire().await;
             tokio::task::spawn_blocking(move || -> anyhow::Result<bitar::VerifiedChunk> {
                 let compressed = archive_chunk.context(ErrorCode::DownloadChunk.to_string())?;
                 let decompressed = compressed
@@ -219,6 +246,7 @@ pub async fn clone_remote_file(
                     .context(ErrorCode::IntegrityCheckFailed.to_string())?;
                 Ok(verified)
             })
+            .await
         })
         .buffered(REMOTE_CHUNK_BUFFER_SIZE);
 
