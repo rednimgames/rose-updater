@@ -1,10 +1,12 @@
 #![windows_subsystem = "windows"]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -949,17 +951,23 @@ async fn update_process(
         }
     }
 
-    // Verify all files after update
-    let all_files = build_full_file_list(&remote_manifest);
-    let files_repaired = get_remote_files(
-        &remote_url,
-        &all_files,
-        &args.output,
-        progress_state,
-        RemoteFilePass::verify(),
-    )
-    .await
-    .context(ErrorCode::CheckForUpdates.to_string())?;
+    // Verify only the files we just updated to catch corrupted downloads.
+    // A full re-verify on every launch is expensive, so we skip it entirely
+    // when nothing changed. Users can still force a full check on demand with
+    // the Repair button or the `--verify` flag.
+    let files_repaired = if files_to_update.is_empty() {
+        0
+    } else {
+        get_remote_files(
+            &remote_url,
+            &files_to_update,
+            &args.output,
+            progress_state,
+            RemoteFilePass::verify(),
+        )
+        .await
+        .context(ErrorCode::CheckForUpdates.to_string())?
+    };
 
     if files_repaired > 0 {
         info!(
@@ -995,7 +1003,7 @@ fn restore_ready_state(
     launch_button.change_state(launch_button::LaunchButtonState::Play);
     launch_button.redraw();
 
-    verify_button.set_label("Verify");
+    verify_button.set_label("Repair");
     verify_button.activate();
     verify_button.show();
     verify_button.redraw();
@@ -1042,13 +1050,67 @@ async fn main() -> anyhow::Result<()> {
     launch_button.deactivate();
 
     // Verify button: small text button under the Play button
-    let mut verify_button = button::Button::new(572, 607, 196, 20, "Verify");
+    let mut verify_button = button::Button::new(572, 607, 196, 20, "Repair");
     verify_button.set_label_size(11);
-    verify_button.set_color(Color::from_rgb(33, 26, 39));
     verify_button.set_label_color(Color::White);
-    verify_button.set_frame(FrameType::FlatBox);
+    // Render as a borderless text "link": no box/background and no focus rect.
+    verify_button.set_frame(FrameType::NoBox);
+    verify_button.clear_visible_focus();
     verify_button.deactivate();
     verify_button.hide();
+
+    // Tracks whether the pointer is currently over the Repair link.
+    let verify_hovered = Rc::new(RefCell::new(false));
+
+    // Draw the Repair button like a text link: repaint the launcher background
+    // behind it (so it appears to have no background of its own) and underline
+    // the label while hovered.
+    verify_button.draw({
+        let verify_hovered = verify_hovered.clone();
+        let mut bg = PngImage::from_data(background_bytes).unwrap();
+        move |b| {
+            // Repaint the slice of the background behind the link so toggling
+            // the underline never leaves artifacts.
+            draw::push_clip(b.x(), b.y(), b.w(), b.h());
+            bg.draw(0, 0, 780, 630);
+            draw::pop_clip();
+
+            draw::set_font(b.label_font(), b.label_size());
+            draw::set_draw_color(b.label_color());
+            draw::draw_text2(&b.label(), b.x(), b.y(), b.w(), b.h(), Align::Center);
+
+            if *verify_hovered.borrow() {
+                let (text_w, text_h) = draw::measure(&b.label(), false);
+                let x0 = b.x() + (b.w() - text_w) / 2;
+                let y0 = b.y() + (b.h() + text_h) / 2 - 1;
+                draw::draw_line(x0, y0, x0 + text_w, y0);
+            }
+        }
+    });
+
+    // Pointer cursor + underline on hover.
+    verify_button.handle({
+        let verify_hovered = verify_hovered.clone();
+        move |b, ev| match ev {
+            Event::Enter => {
+                *verify_hovered.borrow_mut() = true;
+                b.redraw();
+                if let Some(mut win) = b.window() {
+                    win.set_cursor(Cursor::Hand);
+                }
+                true
+            }
+            Event::Leave => {
+                *verify_hovered.borrow_mut() = false;
+                b.redraw();
+                if let Some(mut win) = b.window() {
+                    win.set_cursor(Cursor::Default);
+                }
+                true
+            }
+            _ => false,
+        }
+    });
 
     let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
     webview_win.set_border(false);
