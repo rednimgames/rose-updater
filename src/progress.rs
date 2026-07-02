@@ -14,6 +14,7 @@ pub enum ProgressStage {
     UpdatingUpdater,
     CheckingFiles,
     DownloadingUpdates,
+    VerifyingFiles,
     Play,
 }
 
@@ -25,7 +26,8 @@ impl From<usize> for ProgressStage {
             3 => ProgressStage::UpdatingUpdater,
             4 => ProgressStage::CheckingFiles,
             5 => ProgressStage::DownloadingUpdates,
-            6 => ProgressStage::Play,
+            6 => ProgressStage::VerifyingFiles,
+            7 => ProgressStage::Play,
             _ => ProgressStage::None,
         }
     }

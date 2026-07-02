@@ -167,9 +167,9 @@ pub async fn init_local_clone_output(
     local_chunk_index: bitar::ChunkIndex,
 ) -> anyhow::Result<CloneOutput<tokio::fs::File>> {
     if let Some(parent) = local_file_path.parent() {
-        fs::create_dir_all(parent).await.with_context(|| {
-            format!("{} ({})", ErrorCode::CreateFolder, parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("{} ({})", ErrorCode::CreateFolder, parent.display()))?;
     }
     let local_file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -210,8 +210,7 @@ pub async fn clone_remote_file(
         .chunk_stream(clone_output.chunks())
         .map(|archive_chunk| {
             tokio::task::spawn_blocking(move || -> anyhow::Result<bitar::VerifiedChunk> {
-                let compressed = archive_chunk
-                    .context(ErrorCode::DownloadChunk.to_string())?;
+                let compressed = archive_chunk.context(ErrorCode::DownloadChunk.to_string())?;
                 let decompressed = compressed
                     .decompress()
                     .context(ErrorCode::CorruptDownload.to_string())?;
