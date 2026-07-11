@@ -40,6 +40,7 @@ use rose_update::manifest::{
     LocalManifestFileEntry, RemoteManifest,
 };
 
+pub mod headless;
 pub mod launch_button;
 pub mod progress_bar;
 
@@ -99,6 +100,10 @@ struct Args {
     /// Verify all local files
     #[clap(long)]
     verify: bool,
+
+    /// Run without a window; emit NDJSON events on stdout
+    #[clap(long)]
+    headless: bool,
 
     /// Executable to run after updating
     #[clap(long, default_value = default_exe())]
@@ -909,16 +914,20 @@ async fn update_process(
 
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-        info!("Restarting updater");
-        let current_exe =
-            env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
-        let restart_args: Vec<String> = env::args()
-            .skip(1)
-            // Prevent infinite loop of update rechecks by removing the forced updater check
-            .filter(|arg| !arg.contains("force-recheck-updater"))
-            .collect();
-        spawn_process(&current_exe, &restart_args, None)
-            .context(ErrorCode::RestartLauncher.to_string())?;
+        // A detached self-respawn would orphan the caller's stdout pipe, so in
+        // headless mode we just swap the exe and let the caller respawn us.
+        if !args.headless {
+            info!("Restarting updater");
+            let current_exe =
+                env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
+            let restart_args: Vec<String> = env::args()
+                .skip(1)
+                // Prevent infinite loop of update rechecks by removing the forced updater check
+                .filter(|arg| !arg.contains("force-recheck-updater"))
+                .collect();
+            spawn_process(&current_exe, &restart_args, None)
+                .context(ErrorCode::RestartLauncher.to_string())?;
+        }
 
         return Ok(UpdateProcessResult::UpdaterUpdated);
     }
@@ -1012,19 +1021,30 @@ fn restore_ready_state(
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> process::ExitCode {
     let args = Args::parse();
 
     // Setup tracing for logging
-    let _log_guard = setup_logging(Level::INFO).inspect_err(|e| {
+    let log_guard = setup_logging(Level::INFO, args.headless).inspect_err(|e| {
         eprintln!("Error setting up logging, error: {e}");
 
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title("Initialization Error")
-            .set_description(e.to_string())
-            .show();
-    })?;
+        if !args.headless {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Initialization Error")
+                .set_description(e.to_string())
+                .show();
+        }
+    });
+    let _log_guard = match log_guard {
+        Ok(guard) => guard,
+        Err(_) => return process::ExitCode::FAILURE,
+    };
+
+    // Headless: no window, NDJSON on stdout. Fork before any fltk call.
+    if args.headless {
+        return headless::run_headless(args).await;
+    }
 
     // Load application resources
     let icon_bytes = include_bytes!("../../../res/client.png");
@@ -1033,6 +1053,7 @@ async fn main() -> anyhow::Result<()> {
     let mut background_image = PngImage::from_data(background_bytes).unwrap();
 
     let app = app::App::default().with_scheme(app::AppScheme::Gtk);
+    rose_update::progress::set_notifier(app::awake);
 
     let mut win = window::DoubleWindow::default()
         .with_size(780, 630)
@@ -1117,8 +1138,10 @@ async fn main() -> anyhow::Result<()> {
     webview_win.set_frame(FrameType::NoBox);
     webview_win.make_resizable(false);
 
-    let icon = image::PngImage::from_data(icon_bytes)?;
-    win.set_icon(Some(icon));
+    match image::PngImage::from_data(icon_bytes) {
+        Ok(icon) => win.set_icon(Some(icon)),
+        Err(e) => error!("Failed to load window icon: {}", e),
+    }
 
     win.end();
     win.show();
@@ -1459,13 +1482,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Sending shutdown signal");
-    shutdown_tx.send(true)?;
+    let _ = shutdown_tx.send(true);
     info!("Terminating application");
-    Ok(())
+    process::ExitCode::SUCCESS
 }
 
 fn setup_logging(
     level: tracing::Level,
+    headless: bool,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     let Some(project_dirs) = ProjectDirs::from("com", "Rednim Games", "ROSE Online") else {
         anyhow::bail!("{}", ErrorCode::InitLogging);
@@ -1486,6 +1510,13 @@ fn setup_logging(
     let env_filter = format!("{},hyper=info,mio=info", level);
     let (non_blocking_file_appender, log_guard) = tracing_appender::non_blocking(log_file);
 
+    // In headless mode stdout carries only NDJSON, so tracing goes to stderr.
+    let console_writer: fn() -> Box<dyn io::Write> = if headless {
+        || Box::new(io::stderr())
+    } else {
+        || Box::new(io::stdout())
+    };
+
     let stdout_layer = tracing_subscriber::fmt::layer()
         .event_format(
             tracing_subscriber::fmt::format()
@@ -1493,6 +1524,7 @@ fn setup_logging(
                 .with_line_number(true),
         )
         .pretty()
+        .with_writer(console_writer)
         .with_filter(tracing_subscriber::EnvFilter::new(&env_filter));
 
     let file_layer = tracing_subscriber::fmt::layer()
