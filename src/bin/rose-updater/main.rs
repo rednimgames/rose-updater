@@ -127,6 +127,29 @@ enum UpdateProcessResult {
     UpdaterUpdated,
 }
 
+/// What to do once the updater binary has been swapped on disk.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PostSelfUpdate {
+    /// The running exe is stale: restart (GUI) or hand back to the caller (headless).
+    Restart,
+    /// Keep going in-process: the updater we just wrote is the one already running.
+    Continue,
+}
+
+/// The GUI restarts itself and strips `--force-recheck-updater` from the child's
+/// argv, so a forced recheck settles after one restart. Headless can't do that —
+/// the caller respawns us and re-passes its own argv, forced flag included. So a
+/// forced recheck that rewrote an *unchanged* updater must not report
+/// `UpdaterUpdated`, or the wrapper loops on exit 10 forever. Only a genuinely
+/// stale exe (remote hash != the hash the local manifest recorded) warrants it.
+fn post_self_update(headless: bool, updater_needs_update: bool) -> PostSelfUpdate {
+    if headless && !updater_needs_update {
+        PostSelfUpdate::Continue
+    } else {
+        PostSelfUpdate::Restart
+    }
+}
+
 async fn update_updater(
     local_updater_path: &Path,
     updater_output_path: &Path,
@@ -885,7 +908,9 @@ async fn update_process(
     let updater_output_path = args.output.join(&remote_manifest.updater.source_path);
     let updater_needs_update = remote_manifest.updater.source_hash != local_manifest.updater.hash;
 
-    if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
+    let local_manifest = if !args.skip_updater
+        && (args.force_recheck_updater || updater_needs_update)
+    {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
         let remote = remote_url
@@ -900,7 +925,7 @@ async fn update_process(
             &local_updater_path,
             &updater_output_path,
             &remote,
-            progress_state,
+            progress_state.clone(),
         )
         .await?;
 
@@ -914,23 +939,35 @@ async fn update_process(
 
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-        // A detached self-respawn would orphan the caller's stdout pipe, so in
-        // headless mode we just swap the exe and let the caller respawn us.
-        if !args.headless {
-            info!("Restarting updater");
-            let current_exe =
-                env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
-            let restart_args: Vec<String> = env::args()
-                .skip(1)
-                // Prevent infinite loop of update rechecks by removing the forced updater check
-                .filter(|arg| !arg.contains("force-recheck-updater"))
-                .collect();
-            spawn_process(&current_exe, &restart_args, None)
-                .context(ErrorCode::RestartLauncher.to_string())?;
-        }
+        match post_self_update(args.headless, updater_needs_update) {
+            PostSelfUpdate::Restart => {
+                // A detached self-respawn would orphan the caller's stdout pipe, so
+                // in headless mode we just swap the exe and let the caller respawn us.
+                if !args.headless {
+                    info!("Restarting updater");
+                    let current_exe =
+                        env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
+                    let restart_args: Vec<String> = env::args()
+                        .skip(1)
+                        // Prevent infinite loop of update rechecks by removing the forced updater check
+                        .filter(|arg| !arg.contains("force-recheck-updater"))
+                        .collect();
+                    spawn_process(&current_exe, &restart_args, None)
+                        .context(ErrorCode::RestartLauncher.to_string())?;
+                }
 
-        return Ok(UpdateProcessResult::UpdaterUpdated);
-    }
+                return Ok(UpdateProcessResult::UpdaterUpdated);
+            }
+            PostSelfUpdate::Continue => {
+                info!("Forced updater recheck rewrote an unchanged updater; continuing");
+                // Carry the refreshed manifest forward so the file pass below
+                // records the updater hash we just saved.
+                new_local_manifest
+            }
+        }
+    } else {
+        local_manifest
+    };
 
     let files_to_update = if args.force_recheck {
         build_full_file_list(&remote_manifest)
@@ -1566,6 +1603,30 @@ mod tests {
         assert_eq!(pass.scan_stage, ProgressStage::VerifyingFiles);
         assert_eq!(pass.transfer_stage, ProgressStage::VerifyingFiles);
         assert!(!pass.delete_text_files);
+    }
+
+    #[test]
+    fn headless_forced_recheck_of_unchanged_updater_does_not_ask_for_respawn() {
+        // The loop the exit-10 contract would otherwise cause: a wrapper respawns
+        // us with the same argv (forced flag included), so reporting UpdaterUpdated
+        // for a no-op forced recheck would never terminate.
+        assert_eq!(
+            post_self_update(true, false),
+            PostSelfUpdate::Continue,
+            "headless forced recheck with an unchanged updater must keep going"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_stale_updater_always_restarts() {
+        assert_eq!(post_self_update(true, true), PostSelfUpdate::Restart);
+        assert_eq!(post_self_update(false, true), PostSelfUpdate::Restart);
+    }
+
+    #[test]
+    fn gui_forced_recheck_still_restarts() {
+        // GUI strips the flag from the child's argv, so it settles on its own.
+        assert_eq!(post_self_update(false, false), PostSelfUpdate::Restart);
     }
 
     #[test]
