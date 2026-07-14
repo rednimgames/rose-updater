@@ -96,34 +96,3 @@ impl ProgressState {
         ProgressStage::from(self.stage.load(atomic::Ordering::Relaxed) as usize)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn setters_dont_panic_without_notifier() {
-        // No notifier need be set for these to be safe (pure atomics).
-        let state = ProgressState::default();
-        state.set_max_progress(10);
-        state.set_current_progress(5);
-        state.increment_progress(1);
-        state.set_stage(ProgressStage::CheckingFiles);
-        assert_eq!(state.current_progress(), 6);
-        assert_eq!(state.current_stage(), ProgressStage::CheckingFiles);
-    }
-
-    static NOTIFY_COUNT: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn notifier_fires_when_set() {
-        // set_notifier is only called here in the lib test binary, so this
-        // OnceLock::set wins. The notifier bumps a global counter.
-        set_notifier(|| {
-            NOTIFY_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
-        });
-        let before = NOTIFY_COUNT.load(atomic::Ordering::Relaxed);
-        ProgressState::default().set_stage(ProgressStage::Play);
-        assert!(NOTIFY_COUNT.load(atomic::Ordering::Relaxed) > before);
-    }
-}

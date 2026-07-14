@@ -48,10 +48,29 @@ fn stage_str(stage: ProgressStage) -> &'static str {
 }
 
 fn emit(event: &Event) {
-    if let Ok(line) = serde_json::to_string(event) {
-        println!("{line}");
-        let _ = std::io::stdout().flush();
-    }
+    let Ok(line) = serde_json::to_string(event) else {
+        return;
+    };
+
+    // `println!` panics if stdout is gone (EPIPE) — and our consumer is a parent
+    // process that may exit, be killed, or simply stop reading at any point. Write
+    // through a locked handle and swallow the error so a dead consumer can't crash
+    // an update that is mid-download.
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+/// Emit an `error` event for a failure. Also used for failures that happen before
+/// `run_headless` starts (e.g. logging init), so a consumer always gets the
+/// documented contract instead of a bare exit code and silence.
+pub(crate) fn emit_error(err: &anyhow::Error) {
+    let details = format!("{err:#}");
+    emit(&Event::Error {
+        code: parse_error_code(&details),
+        message: err.to_string(),
+        details,
+    });
 }
 
 /// Best-effort extraction of the numeric code from a "[ROSE-NNN]" prefix
@@ -130,7 +149,11 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
             .map(Outcome::Update)
     };
 
+    // abort() does not preempt a task that is already running: it cancels at the
+    // next await point, and emit() is synchronous. Await the handle so the emitter
+    // is fully stopped and can't slip a `progress` line in after the terminal event.
     emitter.abort();
+    let _ = emitter.await;
 
     // One final snapshot so consumers see the terminal progress values.
     emit(&Event::Progress {
@@ -156,13 +179,7 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
             ExitCode::from(10)
         }
         Err(err) => {
-            let details = format!("{err:#}");
-            let code = parse_error_code(&details);
-            emit(&Event::Error {
-                code,
-                message: err.to_string(),
-                details,
-            });
+            emit_error(&err);
             ExitCode::FAILURE
         }
     }

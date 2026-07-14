@@ -140,14 +140,57 @@ enum PostSelfUpdate {
 /// argv, so a forced recheck settles after one restart. Headless can't do that —
 /// the caller respawns us and re-passes its own argv, forced flag included. So a
 /// forced recheck that rewrote an *unchanged* updater must not report
-/// `UpdaterUpdated`, or the wrapper loops on exit 10 forever. Only a genuinely
-/// stale exe (remote hash != the hash the local manifest recorded) warrants it.
-fn post_self_update(headless: bool, updater_needs_update: bool) -> PostSelfUpdate {
-    if headless && !updater_needs_update {
+/// `UpdaterUpdated`, or the wrapper loops on exit 10 forever.
+///
+/// `updater_changed` must reflect whether the binary on disk actually changed, not
+/// what the local manifest claims — `--force-recheck-updater` exists precisely to
+/// distrust that manifest.
+fn post_self_update(headless: bool, updater_changed: bool) -> PostSelfUpdate {
+    if headless && !updater_changed {
         PostSelfUpdate::Continue
     } else {
         PostSelfUpdate::Restart
     }
+}
+
+/// Did the updater we just wrote actually differ from the one it replaced (i.e. the
+/// binary this process is running)? `update_updater` leaves the previous binary at
+/// `<updater>.old`; if there wasn't one, the updater is new by definition.
+///
+/// This deliberately compares bytes rather than consulting the local manifest: the
+/// only caller is the `--force-recheck-updater` path, whose whole purpose is to not
+/// trust the manifest's recorded hash.
+async fn updater_binary_changed(local_updater_path: &Path) -> anyhow::Result<bool> {
+    let previous_path = local_updater_path.with_extension("old");
+
+    let Ok(previous_meta) = fs::metadata(&previous_path).await else {
+        return Ok(true);
+    };
+
+    let current_meta = fs::metadata(local_updater_path).await.with_context(|| {
+        format!(
+            "{} ({})",
+            ErrorCode::ReadFileMetadata,
+            local_updater_path.display()
+        )
+    })?;
+
+    if previous_meta.len() != current_meta.len() {
+        return Ok(true);
+    }
+
+    let read = |path: PathBuf| async move {
+        fs::read(&path)
+            .await
+            .with_context(|| format!("{} ({})", ErrorCode::OpenFileForReading, path.display()))
+    };
+
+    let (previous, current) = tokio::try_join!(
+        read(previous_path),
+        read(local_updater_path.to_path_buf())
+    )?;
+
+    Ok(previous != current)
 }
 
 async fn update_updater(
@@ -939,7 +982,15 @@ async fn update_process(
 
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-        match post_self_update(args.headless, updater_needs_update) {
+        // The GUI restarts unconditionally, so it never needs this check; only
+        // headless pays for the byte comparison.
+        let updater_changed = if args.headless {
+            updater_binary_changed(&local_updater_path).await?
+        } else {
+            true
+        };
+
+        match post_self_update(args.headless, updater_changed) {
             PostSelfUpdate::Restart => {
                 // A detached self-respawn would orphan the caller's stdout pipe, so
                 // in headless mode we just swap the exe and let the caller respawn us.
@@ -1062,20 +1113,26 @@ async fn main() -> process::ExitCode {
     let args = Args::parse();
 
     // Setup tracing for logging
-    let log_guard = setup_logging(Level::INFO, args.headless).inspect_err(|e| {
-        eprintln!("Error setting up logging, error: {e}");
-
-        if !args.headless {
-            rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Error)
-                .set_title("Initialization Error")
-                .set_description(e.to_string())
-                .show();
-        }
-    });
-    let _log_guard = match log_guard {
+    let _log_guard = match setup_logging(Level::INFO, args.headless) {
         Ok(guard) => guard,
-        Err(_) => return process::ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("Error setting up logging, error: {e}");
+
+            if args.headless {
+                // Headless failures are reported as an `error` event. Without this,
+                // a consumer would see exit 1 and an empty stdout — indistinguishable
+                // from a crash.
+                headless::emit_error(&e);
+            } else {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Initialization Error")
+                    .set_description(e.to_string())
+                    .show();
+            }
+
+            return process::ExitCode::FAILURE;
+        }
     };
 
     // Headless: no window, NDJSON on stdout. Fork before any fltk call.
@@ -1603,6 +1660,41 @@ mod tests {
         assert_eq!(pass.scan_stage, ProgressStage::VerifyingFiles);
         assert_eq!(pass.transfer_stage, ProgressStage::VerifyingFiles);
         assert!(!pass.delete_text_files);
+    }
+
+    /// The notifier is a process-global `OnceLock`, so both halves have to live in
+    /// one test: the unset path must be exercised before anything installs one.
+    /// Lives in the bin target because that is what CI runs (`cargo test --bin
+    /// rose-updater`); in the lib target it would never execute.
+    #[test]
+    fn progress_notifier_is_optional_and_fires_once_set() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+
+        // Nothing installed yet: the setters are pure atomics, as headless relies on.
+        let state = ProgressState::default();
+        state.set_max_progress(10);
+        state.set_current_progress(5);
+        state.increment_progress(1);
+        state.set_stage(ProgressStage::CheckingFiles);
+        assert_eq!(state.current_progress(), 6);
+        assert_eq!(state.current_stage(), ProgressStage::CheckingFiles);
+        assert_eq!(
+            NOTIFIED.load(Ordering::Relaxed),
+            0,
+            "no notifier is installed, so none can have fired"
+        );
+
+        // Once installed (the GUI wires this to fltk's app::awake), setters fire it.
+        rose_update::progress::set_notifier(|| {
+            NOTIFIED.fetch_add(1, Ordering::Relaxed);
+        });
+        state.set_stage(ProgressStage::Play);
+        assert!(
+            NOTIFIED.load(Ordering::Relaxed) > 0,
+            "notifier must fire once set"
+        );
     }
 
     #[test]
