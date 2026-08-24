@@ -1,9 +1,21 @@
-use fltk::app;
-
 use std::sync::{
     atomic::{self, AtomicU64},
-    Arc,
+    Arc, OnceLock,
 };
+
+/// Process-global notifier fired after every progress mutation. The GUI binary
+/// wires this to `fltk::app::awake`; headless mode leaves it unset (pure atomics).
+static NOTIFIER: OnceLock<fn()> = OnceLock::new();
+
+pub fn set_notifier(f: fn()) {
+    let _ = NOTIFIER.set(f);
+}
+
+fn notify() {
+    if let Some(f) = NOTIFIER.get() {
+        f();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(usize)]
@@ -61,23 +73,23 @@ impl ProgressState {
 
     pub fn set_max_progress(&self, val: u64) {
         self.max_progress.store(val, atomic::Ordering::Relaxed);
-        app::awake();
+        notify();
     }
 
     pub fn set_current_progress(&self, val: u64) {
         self.current_progress.store(val, atomic::Ordering::Relaxed);
-        app::awake();
+        notify();
     }
 
     pub fn increment_progress(&self, val: u64) {
         self.current_progress
             .fetch_add(val, atomic::Ordering::Relaxed);
-        app::awake();
+        notify();
     }
 
     pub fn set_stage(&self, val: ProgressStage) {
         self.stage.store(val as u64, atomic::Ordering::Relaxed);
-        app::awake();
+        notify();
     }
 
     pub fn current_stage(&self) -> ProgressStage {

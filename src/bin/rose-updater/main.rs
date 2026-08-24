@@ -40,6 +40,7 @@ use rose_update::manifest::{
     LocalManifestFileEntry, RemoteManifest,
 };
 
+pub mod headless;
 pub mod launch_button;
 pub mod progress_bar;
 
@@ -100,6 +101,10 @@ struct Args {
     #[clap(long)]
     verify: bool,
 
+    /// Run without a window; emit NDJSON events on stdout
+    #[clap(long)]
+    headless: bool,
+
     /// Executable to run after updating
     #[clap(long, default_value = default_exe())]
     exe: PathBuf,
@@ -120,6 +125,72 @@ struct Args {
 enum UpdateProcessResult {
     ApplicationUpdated,
     UpdaterUpdated,
+}
+
+/// What to do once the updater binary has been swapped on disk.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PostSelfUpdate {
+    /// The running exe is stale: restart (GUI) or hand back to the caller (headless).
+    Restart,
+    /// Keep going in-process: the updater we just wrote is the one already running.
+    Continue,
+}
+
+/// The GUI restarts itself and strips `--force-recheck-updater` from the child's
+/// argv, so a forced recheck settles after one restart. Headless can't do that —
+/// the caller respawns us and re-passes its own argv, forced flag included. So a
+/// forced recheck that rewrote an *unchanged* updater must not report
+/// `UpdaterUpdated`, or the wrapper loops on exit 10 forever.
+///
+/// `updater_changed` must reflect whether the binary on disk actually changed, not
+/// what the local manifest claims — `--force-recheck-updater` exists precisely to
+/// distrust that manifest.
+fn post_self_update(headless: bool, updater_changed: bool) -> PostSelfUpdate {
+    if headless && !updater_changed {
+        PostSelfUpdate::Continue
+    } else {
+        PostSelfUpdate::Restart
+    }
+}
+
+/// Did the updater we just wrote actually differ from the one it replaced (i.e. the
+/// binary this process is running)? `update_updater` leaves the previous binary at
+/// `<updater>.old`; if there wasn't one, the updater is new by definition.
+///
+/// This deliberately compares bytes rather than consulting the local manifest: the
+/// only caller is the `--force-recheck-updater` path, whose whole purpose is to not
+/// trust the manifest's recorded hash.
+async fn updater_binary_changed(local_updater_path: &Path) -> anyhow::Result<bool> {
+    let previous_path = local_updater_path.with_extension("old");
+
+    let Ok(previous_meta) = fs::metadata(&previous_path).await else {
+        return Ok(true);
+    };
+
+    let current_meta = fs::metadata(local_updater_path).await.with_context(|| {
+        format!(
+            "{} ({})",
+            ErrorCode::ReadFileMetadata,
+            local_updater_path.display()
+        )
+    })?;
+
+    if previous_meta.len() != current_meta.len() {
+        return Ok(true);
+    }
+
+    let read = |path: PathBuf| async move {
+        fs::read(&path)
+            .await
+            .with_context(|| format!("{} ({})", ErrorCode::OpenFileForReading, path.display()))
+    };
+
+    let (previous, current) = tokio::try_join!(
+        read(previous_path),
+        read(local_updater_path.to_path_buf())
+    )?;
+
+    Ok(previous != current)
 }
 
 async fn update_updater(
@@ -880,7 +951,9 @@ async fn update_process(
     let updater_output_path = args.output.join(&remote_manifest.updater.source_path);
     let updater_needs_update = remote_manifest.updater.source_hash != local_manifest.updater.hash;
 
-    if !args.skip_updater && (args.force_recheck_updater || updater_needs_update) {
+    let local_manifest = if !args.skip_updater
+        && (args.force_recheck_updater || updater_needs_update)
+    {
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
         let remote = remote_url
@@ -895,7 +968,7 @@ async fn update_process(
             &local_updater_path,
             &updater_output_path,
             &remote,
-            progress_state,
+            progress_state.clone(),
         )
         .await?;
 
@@ -909,19 +982,43 @@ async fn update_process(
 
         save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-        info!("Restarting updater");
-        let current_exe =
-            env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
-        let restart_args: Vec<String> = env::args()
-            .skip(1)
-            // Prevent infinite loop of update rechecks by removing the forced updater check
-            .filter(|arg| !arg.contains("force-recheck-updater"))
-            .collect();
-        spawn_process(&current_exe, &restart_args, None)
-            .context(ErrorCode::RestartLauncher.to_string())?;
+        // The GUI restarts unconditionally, so it never needs this check; only
+        // headless pays for the byte comparison.
+        let updater_changed = if args.headless {
+            updater_binary_changed(&local_updater_path).await?
+        } else {
+            true
+        };
 
-        return Ok(UpdateProcessResult::UpdaterUpdated);
-    }
+        match post_self_update(args.headless, updater_changed) {
+            PostSelfUpdate::Restart => {
+                // A detached self-respawn would orphan the caller's stdout pipe, so
+                // in headless mode we just swap the exe and let the caller respawn us.
+                if !args.headless {
+                    info!("Restarting updater");
+                    let current_exe =
+                        env::current_exe().context(ErrorCode::FindLauncherLocation.to_string())?;
+                    let restart_args: Vec<String> = env::args()
+                        .skip(1)
+                        // Prevent infinite loop of update rechecks by removing the forced updater check
+                        .filter(|arg| !arg.contains("force-recheck-updater"))
+                        .collect();
+                    spawn_process(&current_exe, &restart_args, None)
+                        .context(ErrorCode::RestartLauncher.to_string())?;
+                }
+
+                return Ok(UpdateProcessResult::UpdaterUpdated);
+            }
+            PostSelfUpdate::Continue => {
+                info!("Forced updater recheck rewrote an unchanged updater; continuing");
+                // Carry the refreshed manifest forward so the file pass below
+                // records the updater hash we just saved.
+                new_local_manifest
+            }
+        }
+    } else {
+        local_manifest
+    };
 
     let files_to_update = if args.force_recheck {
         build_full_file_list(&remote_manifest)
@@ -1012,19 +1109,36 @@ fn restore_ready_state(
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> process::ExitCode {
     let args = Args::parse();
 
     // Setup tracing for logging
-    let _log_guard = setup_logging(Level::INFO).inspect_err(|e| {
-        eprintln!("Error setting up logging, error: {e}");
+    let _log_guard = match setup_logging(Level::INFO, args.headless) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("Error setting up logging, error: {e}");
 
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title("Initialization Error")
-            .set_description(e.to_string())
-            .show();
-    })?;
+            if args.headless {
+                // Headless failures are reported as an `error` event. Without this,
+                // a consumer would see exit 1 and an empty stdout — indistinguishable
+                // from a crash.
+                headless::emit_error(&e);
+            } else {
+                rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Initialization Error")
+                    .set_description(e.to_string())
+                    .show();
+            }
+
+            return process::ExitCode::FAILURE;
+        }
+    };
+
+    // Headless: no window, NDJSON on stdout. Fork before any fltk call.
+    if args.headless {
+        return headless::run_headless(args).await;
+    }
 
     // Load application resources
     let icon_bytes = include_bytes!("../../../res/client.png");
@@ -1033,6 +1147,7 @@ async fn main() -> anyhow::Result<()> {
     let mut background_image = PngImage::from_data(background_bytes).unwrap();
 
     let app = app::App::default().with_scheme(app::AppScheme::Gtk);
+    rose_update::progress::set_notifier(app::awake);
 
     let mut win = window::DoubleWindow::default()
         .with_size(780, 630)
@@ -1117,8 +1232,10 @@ async fn main() -> anyhow::Result<()> {
     webview_win.set_frame(FrameType::NoBox);
     webview_win.make_resizable(false);
 
-    let icon = image::PngImage::from_data(icon_bytes)?;
-    win.set_icon(Some(icon));
+    match image::PngImage::from_data(icon_bytes) {
+        Ok(icon) => win.set_icon(Some(icon)),
+        Err(e) => error!("Failed to load window icon: {}", e),
+    }
 
     win.end();
     win.show();
@@ -1459,13 +1576,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Sending shutdown signal");
-    shutdown_tx.send(true)?;
+    let _ = shutdown_tx.send(true);
     info!("Terminating application");
-    Ok(())
+    process::ExitCode::SUCCESS
 }
 
 fn setup_logging(
     level: tracing::Level,
+    headless: bool,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     let Some(project_dirs) = ProjectDirs::from("com", "Rednim Games", "ROSE Online") else {
         anyhow::bail!("{}", ErrorCode::InitLogging);
@@ -1486,6 +1604,13 @@ fn setup_logging(
     let env_filter = format!("{},hyper=info,mio=info", level);
     let (non_blocking_file_appender, log_guard) = tracing_appender::non_blocking(log_file);
 
+    // In headless mode stdout carries only NDJSON, so tracing goes to stderr.
+    let console_writer: fn() -> Box<dyn io::Write> = if headless {
+        || Box::new(io::stderr())
+    } else {
+        || Box::new(io::stdout())
+    };
+
     let stdout_layer = tracing_subscriber::fmt::layer()
         .event_format(
             tracing_subscriber::fmt::format()
@@ -1493,6 +1618,7 @@ fn setup_logging(
                 .with_line_number(true),
         )
         .pretty()
+        .with_writer(console_writer)
         .with_filter(tracing_subscriber::EnvFilter::new(&env_filter));
 
     let file_layer = tracing_subscriber::fmt::layer()
@@ -1534,6 +1660,65 @@ mod tests {
         assert_eq!(pass.scan_stage, ProgressStage::VerifyingFiles);
         assert_eq!(pass.transfer_stage, ProgressStage::VerifyingFiles);
         assert!(!pass.delete_text_files);
+    }
+
+    /// The notifier is a process-global `OnceLock`, so both halves have to live in
+    /// one test: the unset path must be exercised before anything installs one.
+    /// Lives in the bin target because that is what CI runs (`cargo test --bin
+    /// rose-updater`); in the lib target it would never execute.
+    #[test]
+    fn progress_notifier_is_optional_and_fires_once_set() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+
+        // Nothing installed yet: the setters are pure atomics, as headless relies on.
+        let state = ProgressState::default();
+        state.set_max_progress(10);
+        state.set_current_progress(5);
+        state.increment_progress(1);
+        state.set_stage(ProgressStage::CheckingFiles);
+        assert_eq!(state.current_progress(), 6);
+        assert_eq!(state.current_stage(), ProgressStage::CheckingFiles);
+        assert_eq!(
+            NOTIFIED.load(Ordering::Relaxed),
+            0,
+            "no notifier is installed, so none can have fired"
+        );
+
+        // Once installed (the GUI wires this to fltk's app::awake), setters fire it.
+        rose_update::progress::set_notifier(|| {
+            NOTIFIED.fetch_add(1, Ordering::Relaxed);
+        });
+        state.set_stage(ProgressStage::Play);
+        assert!(
+            NOTIFIED.load(Ordering::Relaxed) > 0,
+            "notifier must fire once set"
+        );
+    }
+
+    #[test]
+    fn headless_forced_recheck_of_unchanged_updater_does_not_ask_for_respawn() {
+        // The loop the exit-10 contract would otherwise cause: a wrapper respawns
+        // us with the same argv (forced flag included), so reporting UpdaterUpdated
+        // for a no-op forced recheck would never terminate.
+        assert_eq!(
+            post_self_update(true, false),
+            PostSelfUpdate::Continue,
+            "headless forced recheck with an unchanged updater must keep going"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_stale_updater_always_restarts() {
+        assert_eq!(post_self_update(true, true), PostSelfUpdate::Restart);
+        assert_eq!(post_self_update(false, true), PostSelfUpdate::Restart);
+    }
+
+    #[test]
+    fn gui_forced_recheck_still_restarts() {
+        // GUI strips the flag from the child's argv, so it settles on its own.
+        assert_eq!(post_self_update(false, false), PostSelfUpdate::Restart);
     }
 
     #[test]
