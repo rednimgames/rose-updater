@@ -5,3 +5,6 @@ target/
 
 .codex
 .claude
+
+# VSCode
+.vscode/

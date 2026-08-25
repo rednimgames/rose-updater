@@ -1,0 +1,4 @@
+# Fixes "could not find native static library `webview`" on Fedora/RHEL/SUSE.
+# See cmake/install-libdir.cmake. Not forced: a dev's own toolchain file wins.
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/install-libdir.cmake", relative = true }

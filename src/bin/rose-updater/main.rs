@@ -66,6 +66,12 @@ const fn default_exe() -> &'static str {
     }
 }
 
+/// Linux skips the self-update by default so a locally built binary is not
+/// overwritten on launch. Revert by returning `false` unconditionally.
+const fn default_skip_updater() -> bool {
+    cfg!(target_os = "linux")
+}
+
 #[derive(Clone, Parser, Debug)]
 #[clap(about, version, author)]
 struct Args {
@@ -82,7 +88,16 @@ struct Args {
     manifest_name: String,
 
     /// Skip checking for updater update and only update data files
-    #[clap(long)]
+    ///
+    /// Defaults to true on Linux. Use `--skip-updater=false` to re-enable.
+    #[clap(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = default_skip_updater()
+    )]
     skip_updater: bool,
 
     /// Ignore the local manifest in the cache and force all files to be checked
@@ -1253,6 +1268,11 @@ async fn main() -> process::ExitCode {
         }
     };
     ";
+
+    // Some Linux GPU/driver combos render the webview blank. Deliberately the
+    // broad fix: WEBKIT_DISABLE_DMABUF_RENDERER only covers NVIDIA/XWayland.
+    #[cfg(target_os = "linux")]
+    std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
 
     // Create the webview
     let webview = fltk_webview::Webview::create(false, &mut webview_win);
