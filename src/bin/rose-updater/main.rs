@@ -21,7 +21,7 @@ use reqwest::Url;
 use rose_update::error::ErrorCode;
 use rose_update::progress::{ProgressStage, ProgressState};
 use tokio::fs;
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
 #[cfg(windows)]
@@ -58,6 +58,21 @@ const fn default_url() -> &'static str {
     }
 }
 
+/// Where the game files live: the folder the launcher was installed in.
+///
+/// A GUI launch from Finder or a desktop shortcut starts the process in an
+/// unrelated directory such as `/`, so the current directory is no guide to
+/// where the game is. Paths given on the command line stay relative to the
+/// shell the launcher was started from.
+fn default_output() -> PathBuf {
+    match env::current_exe() {
+        Ok(exe) => launcher_dir(&exe)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| PathBuf::from(".")),
+        Err(_) => PathBuf::from("."),
+    }
+}
+
 const fn default_exe() -> &'static str {
     if cfg!(target_os = "windows") {
         "trose.exe"
@@ -80,7 +95,7 @@ struct Args {
     url: String,
 
     /// Output directory
-    #[clap(long, default_value = ".")]
+    #[clap(long, default_value_os_t = default_output())]
     output: PathBuf,
 
     /// Name of manifest file
@@ -296,19 +311,6 @@ fn launcher_dir(exe: &Path) -> io::Result<&Path> {
         })
 }
 
-/// Move the process into the folder the launcher was installed in.
-///
-/// Every default path is relative to the game folder the launcher ships in,
-/// but a GUI launch from Finder or a desktop shortcut starts the process in an
-/// unrelated directory such as `/`, which leaves those defaults pointing at the
-/// wrong place.
-fn anchor_working_dir_to_launcher() -> io::Result<PathBuf> {
-    let exe = env::current_exe()?;
-    let dir = launcher_dir(&exe)?.to_path_buf();
-    env::set_current_dir(&dir)?;
-    Ok(dir)
-}
-
 fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) -> io::Result<()> {
     // A bare program name is resolved through PATH rather than through
     // `current_dir`, so the executable has to be made absolute against the
@@ -454,9 +456,25 @@ mod args_tests {
         assert_eq!(parse(&["--output", "game"]).exe_dir(), Path::new("game"));
     }
 
+    /// A GUI launch starts the process in an unrelated directory such as `/`,
+    /// so the game folder has to be found from the launcher, not from the
+    /// current directory.
     #[test]
-    fn exe_dir_defaults_to_the_current_directory() {
-        assert_eq!(parse(&[]).exe_dir(), Path::new("."));
+    fn output_defaults_to_the_launcher_folder() {
+        let exe = env::current_exe().unwrap();
+        assert_eq!(parse(&[]).output, launcher_dir(&exe).unwrap());
+    }
+
+    /// A path typed on the command line is relative to the shell the launcher
+    /// was started from, and must not be rebased onto the launcher folder.
+    #[test]
+    fn explicit_output_stays_relative_to_the_current_directory() {
+        assert_eq!(parse(&["--output", "game"]).output, Path::new("game"));
+    }
+
+    #[test]
+    fn exe_dir_defaults_to_the_output_directory() {
+        assert_eq!(parse(&[]).exe_dir(), parse(&[]).output);
     }
 
     #[test]
@@ -1279,11 +1297,6 @@ async fn main() -> process::ExitCode {
             return process::ExitCode::FAILURE;
         }
     };
-
-    match anchor_working_dir_to_launcher() {
-        Ok(dir) => info!("Working directory set to {}", dir.display()),
-        Err(e) => warn!("Could not move into the launcher folder: {e}"),
-    }
 
     // Headless: no window, NDJSON on stdout. Fork before any fltk call.
     if args.headless {
