@@ -58,6 +58,21 @@ const fn default_url() -> &'static str {
     }
 }
 
+/// Where the game files live: the folder the launcher was installed in.
+///
+/// A GUI launch from Finder or a desktop shortcut starts the process in an
+/// unrelated directory such as `/`, so the current directory is no guide to
+/// where the game is. Paths given on the command line stay relative to the
+/// shell the launcher was started from.
+fn default_output() -> PathBuf {
+    match env::current_exe() {
+        Ok(exe) => launcher_dir(&exe)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| PathBuf::from(".")),
+        Err(_) => PathBuf::from("."),
+    }
+}
+
 const fn default_exe() -> &'static str {
     if cfg!(target_os = "windows") {
         "trose.exe"
@@ -80,7 +95,7 @@ struct Args {
     url: String,
 
     /// Output directory
-    #[clap(long, default_value = ".")]
+    #[clap(long, default_value_os_t = default_output())]
     output: PathBuf,
 
     /// Name of manifest file
@@ -124,9 +139,9 @@ struct Args {
     #[clap(long, default_value = default_exe())]
     exe: PathBuf,
 
-    /// Working directory to run the executable
-    #[clap(long, default_value = ".")]
-    exe_dir: PathBuf,
+    /// Working directory to run the executable [default: the output directory]
+    #[clap(long)]
+    exe_dir: Option<PathBuf>,
 
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
@@ -135,6 +150,14 @@ struct Args {
         value_delimiter = ' '
     )]
     exe_args: Vec<String>,
+}
+
+impl Args {
+    /// Directory the game is launched from, which is where its files were
+    /// downloaded unless the caller asked for somewhere else.
+    fn exe_dir(&self) -> &Path {
+        self.exe_dir.as_deref().unwrap_or(&self.output)
+    }
 }
 
 enum UpdateProcessResult {
@@ -276,9 +299,26 @@ async fn update_updater(
     Ok(())
 }
 
+/// The folder the launcher executable lives in, which is also the game folder.
+fn launcher_dir(exe: &Path) -> io::Result<&Path> {
+    exe.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("launcher path {} has no parent directory", exe.display()),
+            )
+        })
+}
+
 fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) -> io::Result<()> {
-    let mut cmd = process::Command::new(exe);
-    if let Some(dir) = working_dir {
+    // A bare program name is resolved through PATH rather than through
+    // `current_dir`, so the executable has to be made absolute against the
+    // working directory first.
+    let (file, directory) = resolve_launch_paths(exe, working_dir)?;
+
+    let mut cmd = process::Command::new(&file);
+    if let Some(dir) = directory.as_deref() {
         cmd.current_dir(dir);
     }
     cmd.args(args)
@@ -289,8 +329,7 @@ fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) ->
     Ok(())
 }
 
-#[cfg(windows)]
-fn resolve_shell_paths(
+fn resolve_launch_paths(
     exe: &Path,
     working_dir: Option<&Path>,
 ) -> io::Result<(PathBuf, Option<PathBuf>)> {
@@ -354,7 +393,7 @@ fn spawn_process_shell(exe: &Path, args: &[String], working_dir: Option<&Path>) 
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    let (file, directory) = resolve_shell_paths(exe, working_dir)?;
+    let (file, directory) = resolve_launch_paths(exe, working_dir)?;
     let parameters = (!args.is_empty()).then(|| {
         let mut encoded = encode_windows_command_line(args);
         encoded.push(0);
@@ -398,6 +437,115 @@ fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> any
 fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
     spawn_process_std(exe, args, working_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        let mut argv = vec!["rose-updater"];
+        argv.extend_from_slice(args);
+        Args::parse_from(argv)
+    }
+
+    /// The game is launched from wherever it was downloaded to, so pointing
+    /// `--output` somewhere else has to move the launch directory with it.
+    #[test]
+    fn exe_dir_follows_the_output_directory() {
+        assert_eq!(parse(&["--output", "game"]).exe_dir(), Path::new("game"));
+    }
+
+    /// A GUI launch starts the process in an unrelated directory such as `/`,
+    /// so the game folder has to be found from the launcher, not from the
+    /// current directory.
+    #[test]
+    fn output_defaults_to_the_launcher_folder() {
+        let exe = env::current_exe().unwrap();
+        assert_eq!(parse(&[]).output, launcher_dir(&exe).unwrap());
+    }
+
+    /// A path typed on the command line is relative to the shell the launcher
+    /// was started from, and must not be rebased onto the launcher folder.
+    #[test]
+    fn explicit_output_stays_relative_to_the_current_directory() {
+        assert_eq!(parse(&["--output", "game"]).output, Path::new("game"));
+    }
+
+    #[test]
+    fn exe_dir_defaults_to_the_output_directory() {
+        assert_eq!(parse(&[]).exe_dir(), parse(&[]).output);
+    }
+
+    #[test]
+    fn explicit_exe_dir_overrides_the_output_directory() {
+        assert_eq!(
+            parse(&["--output", "game", "--exe-dir", "elsewhere"]).exe_dir(),
+            Path::new("elsewhere")
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    #[test]
+    fn launcher_dir_is_the_folder_holding_the_executable() {
+        assert_eq!(
+            launcher_dir(Path::new("/opt/rose/rose-updater")).unwrap(),
+            Path::new("/opt/rose")
+        );
+    }
+
+    #[test]
+    fn launcher_dir_rejects_a_bare_file_name() {
+        // `Path::parent` yields an empty path here, which is not a directory
+        // the process can move into.
+        assert!(launcher_dir(Path::new("rose-updater")).is_err());
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("rose-spawn-{}-{}", process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolves_relative_executable_against_working_directory() {
+        let (file, directory) =
+            resolve_launch_paths(Path::new(default_exe()), Some(Path::new("game"))).unwrap();
+
+        assert_eq!(
+            file,
+            std::path::absolute(Path::new("game").join(default_exe())).unwrap()
+        );
+        assert_eq!(
+            directory,
+            Some(std::path::absolute(Path::new("game")).unwrap())
+        );
+    }
+
+    /// The game is launched as a bare `trose` name with the game folder passed
+    /// as the working directory. `Command` resolves a program name without a
+    /// separator through `PATH`, not through `current_dir`, so the executable
+    /// must be resolved against the working directory before spawning.
+    #[cfg(unix)]
+    #[test]
+    fn spawns_relative_executable_from_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("relative-exe");
+        let exe = dir.join(default_exe());
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = spawn_process_std(Path::new(default_exe()), &[], Some(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -504,7 +652,7 @@ mod windows_spawn_tests {
     #[test]
     fn resolves_default_windows_launch_paths_to_absolute() {
         let (file, directory) =
-            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("."))).unwrap();
+            resolve_launch_paths(Path::new("trose.exe"), Some(Path::new("."))).unwrap();
 
         assert_eq!(
             file,
@@ -519,7 +667,7 @@ mod windows_spawn_tests {
     #[test]
     fn resolves_relative_executable_against_custom_directory() {
         let (file, directory) =
-            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("game"))).unwrap();
+            resolve_launch_paths(Path::new("trose.exe"), Some(Path::new("game"))).unwrap();
 
         assert_eq!(
             file,
@@ -535,7 +683,7 @@ mod windows_spawn_tests {
     fn preserves_absolute_executable_paths() {
         let absolute_exe = std::path::absolute(Path::new("trose.exe")).unwrap();
         let (file, directory) =
-            resolve_shell_paths(&absolute_exe, Some(Path::new("game"))).unwrap();
+            resolve_launch_paths(&absolute_exe, Some(Path::new("game"))).unwrap();
 
         assert_eq!(file, absolute_exe);
         assert_eq!(
@@ -1329,7 +1477,7 @@ async fn main() -> process::ExitCode {
 
     // Clone some args before moving args into download task
     let exe = args.exe.clone();
-    let exe_dir = args.exe_dir.clone();
+    let exe_dir = args.exe_dir().to_path_buf();
     let exe_args = args.exe_args.clone();
 
     // Store args needed for verify button
