@@ -1172,6 +1172,18 @@ async fn main() -> process::ExitCode {
     let mut background_frame = Frame::new(0, 0, 780, 630, "");
     background_frame.draw(move |_| {
         background_image.draw(0, 0, 780, 630);
+
+        // Keep the version beside the Rednim logo on every background redraw.
+        draw::set_font(Font::Helvetica, 11);
+        draw::set_draw_color(Color::from_rgb(179, 179, 179));
+        draw::draw_text2(
+            concat!("v", env!("CARGO_PKG_VERSION")),
+            103,
+            607,
+            450,
+            20,
+            Align::Left | Align::Inside,
+        );
     });
 
     let mut main_progress_bar = progress_bar::ProgressBar::new(12, 547);
