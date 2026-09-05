@@ -21,7 +21,7 @@ use reqwest::Url;
 use rose_update::error::ErrorCode;
 use rose_update::progress::{ProgressStage, ProgressState};
 use tokio::fs;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
 #[cfg(windows)]
@@ -276,6 +276,31 @@ async fn update_updater(
     Ok(())
 }
 
+/// The folder the launcher executable lives in, which is also the game folder.
+fn launcher_dir(exe: &Path) -> io::Result<&Path> {
+    exe.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("launcher path {} has no parent directory", exe.display()),
+            )
+        })
+}
+
+/// Move the process into the folder the launcher was installed in.
+///
+/// Every default path is relative to the game folder the launcher ships in,
+/// but a GUI launch from Finder or a desktop shortcut starts the process in an
+/// unrelated directory such as `/`, which leaves those defaults pointing at the
+/// wrong place.
+fn anchor_working_dir_to_launcher() -> io::Result<PathBuf> {
+    let exe = env::current_exe()?;
+    let dir = launcher_dir(&exe)?.to_path_buf();
+    env::set_current_dir(&dir)?;
+    Ok(dir)
+}
+
 fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) -> io::Result<()> {
     // A bare program name is resolved through PATH rather than through
     // `current_dir`, so the executable has to be made absolute against the
@@ -407,6 +432,21 @@ fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> any
 #[cfg(test)]
 mod spawn_tests {
     use super::*;
+
+    #[test]
+    fn launcher_dir_is_the_folder_holding_the_executable() {
+        assert_eq!(
+            launcher_dir(Path::new("/opt/rose/rose-updater")).unwrap(),
+            Path::new("/opt/rose")
+        );
+    }
+
+    #[test]
+    fn launcher_dir_rejects_a_bare_file_name() {
+        // `Path::parent` yields an empty path here, which is not a directory
+        // the process can move into.
+        assert!(launcher_dir(Path::new("rose-updater")).is_err());
+    }
 
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("rose-spawn-{}-{}", process::id(), name));
@@ -1200,6 +1240,11 @@ async fn main() -> process::ExitCode {
             return process::ExitCode::FAILURE;
         }
     };
+
+    match anchor_working_dir_to_launcher() {
+        Ok(dir) => info!("Working directory set to {}", dir.display()),
+        Err(e) => warn!("Could not move into the launcher folder: {e}"),
+    }
 
     // Headless: no window, NDJSON on stdout. Fork before any fltk call.
     if args.headless {
