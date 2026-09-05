@@ -124,9 +124,9 @@ struct Args {
     #[clap(long, default_value = default_exe())]
     exe: PathBuf,
 
-    /// Working directory to run the executable
-    #[clap(long, default_value = ".")]
-    exe_dir: PathBuf,
+    /// Working directory to run the executable [default: the output directory]
+    #[clap(long)]
+    exe_dir: Option<PathBuf>,
 
     /// Arguments for the executable
     /// NOTE: This must be the last option in the command line to properly handle
@@ -135,6 +135,14 @@ struct Args {
         value_delimiter = ' '
     )]
     exe_args: Vec<String>,
+}
+
+impl Args {
+    /// Directory the game is launched from, which is where its files were
+    /// downloaded unless the caller asked for somewhere else.
+    fn exe_dir(&self) -> &Path {
+        self.exe_dir.as_deref().unwrap_or(&self.output)
+    }
 }
 
 enum UpdateProcessResult {
@@ -427,6 +435,37 @@ fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> any
 fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
     spawn_process_std(exe, args, working_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Args {
+        let mut argv = vec!["rose-updater"];
+        argv.extend_from_slice(args);
+        Args::parse_from(argv)
+    }
+
+    /// The game is launched from wherever it was downloaded to, so pointing
+    /// `--output` somewhere else has to move the launch directory with it.
+    #[test]
+    fn exe_dir_follows_the_output_directory() {
+        assert_eq!(parse(&["--output", "game"]).exe_dir(), Path::new("game"));
+    }
+
+    #[test]
+    fn exe_dir_defaults_to_the_current_directory() {
+        assert_eq!(parse(&[]).exe_dir(), Path::new("."));
+    }
+
+    #[test]
+    fn explicit_exe_dir_overrides_the_output_directory() {
+        assert_eq!(
+            parse(&["--output", "game", "--exe-dir", "elsewhere"]).exe_dir(),
+            Path::new("elsewhere")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1425,7 +1464,7 @@ async fn main() -> process::ExitCode {
 
     // Clone some args before moving args into download task
     let exe = args.exe.clone();
-    let exe_dir = args.exe_dir.clone();
+    let exe_dir = args.exe_dir().to_path_buf();
     let exe_args = args.exe_args.clone();
 
     // Store args needed for verify button
