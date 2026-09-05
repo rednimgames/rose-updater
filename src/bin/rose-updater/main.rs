@@ -277,8 +277,13 @@ async fn update_updater(
 }
 
 fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) -> io::Result<()> {
-    let mut cmd = process::Command::new(exe);
-    if let Some(dir) = working_dir {
+    // A bare program name is resolved through PATH rather than through
+    // `current_dir`, so the executable has to be made absolute against the
+    // working directory first.
+    let (file, directory) = resolve_launch_paths(exe, working_dir)?;
+
+    let mut cmd = process::Command::new(&file);
+    if let Some(dir) = directory.as_deref() {
         cmd.current_dir(dir);
     }
     cmd.args(args)
@@ -289,8 +294,7 @@ fn spawn_process_std(exe: &Path, args: &[String], working_dir: Option<&Path>) ->
     Ok(())
 }
 
-#[cfg(windows)]
-fn resolve_shell_paths(
+fn resolve_launch_paths(
     exe: &Path,
     working_dir: Option<&Path>,
 ) -> io::Result<(PathBuf, Option<PathBuf>)> {
@@ -354,7 +358,7 @@ fn spawn_process_shell(exe: &Path, args: &[String], working_dir: Option<&Path>) 
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    let (file, directory) = resolve_shell_paths(exe, working_dir)?;
+    let (file, directory) = resolve_launch_paths(exe, working_dir)?;
     let parameters = (!args.is_empty()).then(|| {
         let mut encoded = encode_windows_command_line(args);
         encoded.push(0);
@@ -398,6 +402,53 @@ fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> any
 fn spawn_process(exe: &Path, args: &[String], working_dir: Option<&Path>) -> anyhow::Result<()> {
     spawn_process_std(exe, args, working_dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("rose-spawn-{}-{}", process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolves_relative_executable_against_working_directory() {
+        let (file, directory) =
+            resolve_launch_paths(Path::new(default_exe()), Some(Path::new("game"))).unwrap();
+
+        assert_eq!(
+            file,
+            std::path::absolute(Path::new("game").join(default_exe())).unwrap()
+        );
+        assert_eq!(
+            directory,
+            Some(std::path::absolute(Path::new("game")).unwrap())
+        );
+    }
+
+    /// The game is launched as a bare `trose` name with the game folder passed
+    /// as the working directory. `Command` resolves a program name without a
+    /// separator through `PATH`, not through `current_dir`, so the executable
+    /// must be resolved against the working directory before spawning.
+    #[cfg(unix)]
+    #[test]
+    fn spawns_relative_executable_from_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("relative-exe");
+        let exe = dir.join(default_exe());
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = spawn_process_std(Path::new(default_exe()), &[], Some(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        result.unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -504,7 +555,7 @@ mod windows_spawn_tests {
     #[test]
     fn resolves_default_windows_launch_paths_to_absolute() {
         let (file, directory) =
-            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("."))).unwrap();
+            resolve_launch_paths(Path::new("trose.exe"), Some(Path::new("."))).unwrap();
 
         assert_eq!(
             file,
@@ -519,7 +570,7 @@ mod windows_spawn_tests {
     #[test]
     fn resolves_relative_executable_against_custom_directory() {
         let (file, directory) =
-            resolve_shell_paths(Path::new("trose.exe"), Some(Path::new("game"))).unwrap();
+            resolve_launch_paths(Path::new("trose.exe"), Some(Path::new("game"))).unwrap();
 
         assert_eq!(
             file,
@@ -535,7 +586,7 @@ mod windows_spawn_tests {
     fn preserves_absolute_executable_paths() {
         let absolute_exe = std::path::absolute(Path::new("trose.exe")).unwrap();
         let (file, directory) =
-            resolve_shell_paths(&absolute_exe, Some(Path::new("game"))).unwrap();
+            resolve_launch_paths(&absolute_exe, Some(Path::new("game"))).unwrap();
 
         assert_eq!(file, absolute_exe);
         assert_eq!(
