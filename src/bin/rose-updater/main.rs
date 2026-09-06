@@ -1306,6 +1306,7 @@ async fn main() -> process::ExitCode {
     // Load application resources
     let icon_bytes = include_bytes!("../../../res/client.png");
     let background_bytes = include_bytes!("../../../res/Launcher_Alpha_Background.png");
+    let repair_bytes = include_bytes!("../../../res/repair-wide.png");
 
     let mut background_image = PngImage::from_data(background_bytes).unwrap();
 
@@ -1340,7 +1341,7 @@ async fn main() -> process::ExitCode {
     launch_button.deactivate();
 
     // Verify button: small text button under the Play button
-    let mut verify_button = button::Button::new(572, 607, 196, 20, "Repair");
+    let mut verify_button = button::Button::new(572, 605, 196, 23, "Repair");
     verify_button.set_label_size(11);
     verify_button.set_label_color(Color::White);
     // Render as a borderless text "link": no box/background and no focus rect.
@@ -1358,12 +1359,27 @@ async fn main() -> process::ExitCode {
     verify_button.draw({
         let verify_hovered = verify_hovered.clone();
         let mut bg = PngImage::from_data(background_bytes).unwrap();
+        let mut repair = PngImage::from_data(repair_bytes).unwrap();
+        repair.scale(196, 23, false, true);
+        let mut repair_hover =
+            PngImage::from_data(include_bytes!("../../../res/repair-wide-hover.png")).unwrap();
+        repair_hover.scale(196, 23, false, true);
         move |b| {
             // Repaint the slice of the background behind the link so toggling
             // the underline never leaves artifacts.
             draw::push_clip(b.x(), b.y(), b.w(), b.h());
             bg.draw(0, 0, 780, 630);
             draw::pop_clip();
+
+            // The Repair state is an image; "Stop" (while verifying) is text.
+            if b.label() == "Repair" {
+                if *verify_hovered.borrow() {
+                    repair_hover.draw(b.x(), b.y(), b.w(), b.h());
+                } else {
+                    repair.draw(b.x(), b.y(), b.w(), b.h());
+                }
+                return;
+            }
 
             draw::set_font(b.label_font(), b.label_size());
             draw::set_draw_color(b.label_color());
@@ -1402,7 +1418,70 @@ async fn main() -> process::ExitCode {
         }
     });
 
-    let mut webview_win = window::Window::default().with_size(780, 530).with_pos(0, 0);
+    // Social links: brand buttons on a plate, top right, in a strip above the
+    // news webview.
+    let mut social_group = group::Group::new(657, 3, 112, 38, None);
+    let mut plate = Frame::new(657, 3, 112, 38, None);
+    let mut plate_image = PngImage::from_data(include_bytes!("../../../res/social-plate.png")).unwrap();
+    plate_image.scale(112, 38, false, true);
+    plate.set_image(Some(plate_image));
+    let socials = [
+        (
+            "Discord",
+            "https://discord.gg/ZUVSsdxbyD",
+            include_bytes!("../../../res/discord.png") as &[u8],
+            include_bytes!("../../../res/discord-hover.png") as &[u8],
+        ),
+        (
+            "YouTube",
+            "https://www.youtube.com/@ROSEOnlineMMO",
+            include_bytes!("../../../res/youtube.png"),
+            include_bytes!("../../../res/youtube-hover.png"),
+        ),
+        (
+            "Facebook",
+            "https://www.facebook.com/roseonlinemmo",
+            include_bytes!("../../../res/facebook.png"),
+            include_bytes!("../../../res/facebook-hover.png"),
+        ),
+    ];
+    for (i, (name, url, normal, hover)) in socials.into_iter().enumerate() {
+        let mut b = button::Button::new(665 + 35 * i as i32, 8, 28, 28, None);
+        b.set_tooltip(name);
+        b.clear_visible_focus();
+        let hovered = Rc::new(RefCell::new(false));
+        b.draw({
+            let hovered = hovered.clone();
+            let mut normal = PngImage::from_data(normal).unwrap();
+            let mut hover = PngImage::from_data(hover).unwrap();
+            normal.scale(28, 28, true, true);
+            hover.scale(28, 28, true, true);
+            move |b| {
+                let img = if *hovered.borrow() { &mut hover } else { &mut normal };
+                img.draw(b.x(), b.y(), b.w(), b.h());
+            }
+        });
+        b.handle(move |b, ev| match ev {
+            Event::Enter | Event::Leave => {
+                *hovered.borrow_mut() = ev == Event::Enter;
+                b.redraw();
+                if let Some(mut win) = b.window() {
+                    win.set_cursor(if ev == Event::Enter { Cursor::Hand } else { Cursor::Default });
+                }
+                true
+            }
+            _ => false,
+        });
+        b.set_callback(move |_| {
+            info!("Opening url in native browser: {}", url);
+            if let Err(e) = open::that(url) {
+                error!("Failed to open URL in browser: {}", e);
+            }
+        });
+    }
+    social_group.end();
+
+    let mut webview_win = window::Window::default().with_size(780, 488).with_pos(0, 42);
     webview_win.set_border(false);
     webview_win.set_frame(FrameType::NoBox);
     webview_win.make_resizable(false);
@@ -1740,6 +1819,7 @@ async fn main() -> process::ExitCode {
             // we've redrawn it
             launch_button.redraw();
             verify_button.redraw();
+            social_group.redraw();
         }
 
         let current_progress = progress_state.current_progress() as usize;
