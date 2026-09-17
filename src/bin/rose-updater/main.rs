@@ -16,6 +16,7 @@ use directories::ProjectDirs;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
+#[cfg(feature = "webview")]
 use fltk_webview::FromFltkWindow;
 use reqwest::Url;
 use rose_update::error::ErrorCode;
@@ -47,6 +48,8 @@ pub mod progress_bar;
 const LOCAL_MANIFEST_VERSION: usize = 1;
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
+
+const NEWS_URL: &str = "https://roseonlinegame.com/launcher.html";
 
 const fn default_url() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -801,11 +804,12 @@ async fn run_verify_process(
     verify_url: &str,
     manifest_name: &str,
     output_dir: &Path,
+    exe: &Path,
     progress_state: ProgressState,
 ) -> anyhow::Result<usize> {
     let remote_url = parse_remote_url(verify_url)?;
 
-    verify_and_repair(&remote_url, manifest_name, output_dir, progress_state).await
+    verify_and_repair(&remote_url, manifest_name, output_dir, exe, progress_state).await
 }
 
 /// Check which files need to be updated by comparing our local manifest to the remote manifest
@@ -1045,10 +1049,31 @@ fn build_full_file_list(remote_manifest: &RemoteManifest) -> Vec<FileToDownload>
 
 /// Verify all files against the remote manifest and repair any that are corrupted.
 /// Returns the number of files that were repaired.
+/// Restore the execute bit on the game binary. bitar creates files with the
+/// default 0644, so this has to run after every pass that may have rewritten it,
+/// repairs included.
+fn set_game_exe_executable(output_dir: &Path, exe: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let exe_path = output_dir.join(exe);
+        if exe_path.exists() {
+            std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755))
+                .context("Failed to set execute permission on game executable")?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (output_dir, exe);
+    }
+    Ok(())
+}
+
 async fn verify_and_repair(
     remote_url: &Url,
     manifest_name: &str,
     output_dir: &Path,
+    exe: &Path,
     progress_state: ProgressState,
 ) -> anyhow::Result<usize> {
     progress_state.set_stage(ProgressStage::FetchingMetadata);
@@ -1068,6 +1093,9 @@ async fn verify_and_repair(
         RemoteFilePass::verify(),
     )
     .await?;
+
+    // A repair may have rewritten the game binary as 0644.
+    set_game_exe_executable(output_dir, exe)?;
 
     // Update local manifest to match remote after verification
     let local_manifest_path = local_manifest_path(output_dir, remote_url);
@@ -1199,17 +1227,7 @@ async fn update_process(
     .await
     .context(ErrorCode::CheckForUpdates.to_string())?;
 
-    // Set execute permission on the game executable for Unix platforms
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let exe_path = args.output.join(&args.exe);
-        if exe_path.exists() {
-            let perms = std::fs::Permissions::from_mode(0o755);
-            std::fs::set_permissions(&exe_path, perms)
-                .context("Failed to set execute permission on game executable")?;
-        }
-    }
+    set_game_exe_executable(&args.output, &args.exe)?;
 
     // Verify only the files we just updated to catch corrupted downloads.
     // A full re-verify on every launch is expensive, so we skip it entirely
@@ -1481,10 +1499,61 @@ async fn main() -> process::ExitCode {
     }
     social_group.end();
 
-    let mut webview_win = window::Window::default().with_size(780, 488).with_pos(0, 42);
-    webview_win.set_border(false);
-    webview_win.set_frame(FrameType::NoBox);
-    webview_win.make_resizable(false);
+    #[cfg(feature = "webview")]
+    let mut webview_win = {
+        let mut webview_win = window::Window::default().with_size(780, 488).with_pos(0, 42);
+        webview_win.set_border(false);
+        webview_win.set_frame(FrameType::NoBox);
+        webview_win.make_resizable(false);
+        webview_win
+    };
+
+    // Without the webview the background art fills the panel area, so offer the
+    // news as a link into the system browser instead.
+    #[cfg(not(feature = "webview"))]
+    {
+        let mut news = button::Button::new(292, 270, 196, 22, "Latest News");
+        news.set_label_size(13);
+        news.set_label_color(Color::White);
+        news.set_frame(FrameType::NoBox);
+        news.clear_visible_focus();
+        let hovered = Rc::new(RefCell::new(false));
+        news.draw({
+            let hovered = hovered.clone();
+            let mut bg = PngImage::from_data(background_bytes).unwrap();
+            move |b| {
+                draw::push_clip(b.x(), b.y(), b.w(), b.h());
+                bg.draw(0, 0, 780, 630);
+                draw::pop_clip();
+                draw::set_font(b.label_font(), b.label_size());
+                draw::set_draw_color(b.label_color());
+                draw::draw_text2(&b.label(), b.x(), b.y(), b.w(), b.h(), Align::Center);
+                if *hovered.borrow() {
+                    let (tw, th) = draw::measure(&b.label(), false);
+                    let x0 = b.x() + (b.w() - tw) / 2;
+                    let y0 = b.y() + (b.h() + th) / 2 - 1;
+                    draw::draw_line(x0, y0, x0 + tw, y0);
+                }
+            }
+        });
+        news.handle(move |b, ev| match ev {
+            Event::Enter | Event::Leave => {
+                *hovered.borrow_mut() = ev == Event::Enter;
+                b.redraw();
+                if let Some(mut win) = b.window() {
+                    win.set_cursor(if ev == Event::Enter { Cursor::Hand } else { Cursor::Default });
+                }
+                true
+            }
+            _ => false,
+        });
+        news.set_callback(|_| {
+            info!("Opening news in native browser: {}", NEWS_URL);
+            if let Err(e) = open::that(NEWS_URL) {
+                error!("Failed to open URL in browser: {}", e);
+            }
+        });
+    }
 
     match image::PngImage::from_data(icon_bytes) {
         Ok(icon) => win.set_icon(Some(icon)),
@@ -1494,53 +1563,58 @@ async fn main() -> process::ExitCode {
     win.end();
     win.show();
 
-    // Script used in the webview to force links to be opened in the native
-    // browser rather than in the webview.
-    let script = "
-    window.onload = function() {
-        const links = document.getElementsByTagName('a');
-        for (const link of links) {
-            link.onclick = function() {
-                open_url(link.href);
-                return false; // prevent default
-            }
-        }
-    };
-    ";
-
-    // Some Linux GPU/driver combos render the webview blank. Deliberately the
-    // broad fix: WEBKIT_DISABLE_DMABUF_RENDERER only covers NVIDIA/XWayland.
-    #[cfg(target_os = "linux")]
-    std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-
-    // Create the webview
-    let webview = fltk_webview::Webview::create(false, &mut webview_win);
-    if let Err(e) = webview.bind("open_url", |_, content| {
-        let parsed: serde_json::Value = match serde_json::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to parse webview callback data: {}", e);
-                return;
+    // Bound for the lifetime of main: dropping it would tear down the webview.
+    #[cfg(feature = "webview")]
+    let _webview = {
+        // Script used in the webview to force links to be opened in the native
+        // browser rather than in the webview.
+        let script = "
+        window.onload = function() {
+            const links = document.getElementsByTagName('a');
+            for (const link of links) {
+                link.onclick = function() {
+                    open_url(link.href);
+                    return false; // prevent default
+                }
             }
         };
+        ";
 
-        // Open the url in the native browser
-        let url = parsed.get(0).and_then(|url_param| url_param.as_str());
-        if let Some(url) = url {
-            info!("Opening url in native browser: {}", url);
-            if let Err(e) = open::that(url) {
-                error!("Failed to open URL in browser: {}", e);
+        // Some Linux GPU/driver combos render the webview blank. Deliberately the
+        // broad fix: WEBKIT_DISABLE_DMABUF_RENDERER only covers NVIDIA/XWayland.
+        #[cfg(target_os = "linux")]
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+
+        // Create the webview
+        let webview = fltk_webview::Webview::create(false, &mut webview_win);
+        if let Err(e) = webview.bind("open_url", |_, content| {
+            let parsed: serde_json::Value = match serde_json::from_str(content) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Failed to parse webview callback data: {}", e);
+                    return;
+                }
+            };
+
+            // Open the url in the native browser
+            let url = parsed.get(0).and_then(|url_param| url_param.as_str());
+            if let Some(url) = url {
+                info!("Opening url in native browser: {}", url);
+                if let Err(e) = open::that(url) {
+                    error!("Failed to open URL in browser: {}", e);
+                }
             }
+        }) {
+            error!("Failed to bind webview callback: {}", e);
         }
-    }) {
-        error!("Failed to bind webview callback: {}", e);
-    }
-    if let Err(e) = webview.init(script) {
-        error!("Failed to initialize webview: {}", e);
-    }
-    if let Err(e) = webview.navigate("https://roseonlinegame.com/launcher.html") {
-        error!("Failed to navigate webview: {}", e);
-    }
+        if let Err(e) = webview.init(script) {
+            error!("Failed to initialize webview: {}", e);
+        }
+        if let Err(e) = webview.navigate(NEWS_URL) {
+            error!("Failed to navigate webview: {}", e);
+        }
+        webview
+    };
 
     // general channel
     let (app_message_sender, app_message_receiver) = app::channel::<Message>();
@@ -1563,6 +1637,7 @@ async fn main() -> process::ExitCode {
     let verify_url = args.url.clone();
     let verify_manifest_name = args.manifest_name.clone();
     let verify_output = args.output.clone();
+    let verify_exe = args.exe.clone();
 
     // When the launch button is clicked we start the application
     launch_button.set_callback(move |_| {
@@ -1603,6 +1678,7 @@ async fn main() -> process::ExitCode {
         let verify_url = verify_url.clone();
         let verify_manifest_name = verify_manifest_name.clone();
         let verify_output = verify_output.clone();
+        let verify_exe = verify_exe.clone();
 
         verify_button.set_callback(move |btn| {
             let cancel_tx = verify_cancel_tx.clone();
@@ -1630,6 +1706,7 @@ async fn main() -> process::ExitCode {
             let verify_url = verify_url.clone();
             let verify_manifest_name = verify_manifest_name.clone();
             let verify_output = verify_output.clone();
+            let verify_exe = verify_exe.clone();
 
             let (cancel_send, mut cancel_recv) = tokio::sync::watch::channel(false);
             let cancel_tx_clone = cancel_tx.clone();
@@ -1645,6 +1722,7 @@ async fn main() -> process::ExitCode {
                         &verify_url,
                         &verify_manifest_name,
                         &verify_output,
+                        &verify_exe,
                         progress_state,
                     ) => res,
                     _ = cancel_recv.changed() => {
@@ -1685,6 +1763,7 @@ async fn main() -> process::ExitCode {
         let verify_url_for_task = args.url.clone();
         let verify_manifest_for_task = args.manifest_name.clone();
         let verify_output_for_task = args.output.clone();
+        let verify_exe_for_task = args.exe.clone();
 
         tokio::spawn(async move {
             if verify_only {
@@ -1694,6 +1773,7 @@ async fn main() -> process::ExitCode {
                         &verify_url_for_task,
                         &verify_manifest_for_task,
                         &verify_output_for_task,
+                        &verify_exe_for_task,
                         progress_state,
                     ) => res,
                     _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Verification cancelled"))

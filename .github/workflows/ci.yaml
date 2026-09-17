@@ -35,7 +35,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v6
@@ -45,7 +45,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies (Ubuntu only)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         run: sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev
 
       - uses: Swatinem/rust-cache@v2
@@ -58,3 +58,32 @@ jobs:
         run: cargo build --release
         env:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C link-arg=-weak_framework -C link-arg=ScreenCaptureKit -C link-arg=-weak_framework -C link-arg=UniformTypeIdentifiers' || '' }}
+
+  build-nowebview:
+    name: Build without webview (SteamOS variant)
+    needs: version-bump
+    if: always() && (needs.version-bump.result == 'success' || needs.version-bump.result == 'skipped')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # libwebkit2gtk-4.1-dev is deliberately NOT installed: this variant must
+      # build and link without it, or it will not start on SteamOS.
+      - name: Build in release mode
+        run: cargo build --release --no-default-features --bin rose-updater
+
+      - name: Assert no webkit linkage
+        run: |
+          if objdump -p target/release/rose-updater | grep -qiE 'NEEDED.*(webkit|javascriptcore)'; then
+            echo "Error: the no-webview build still links webkit"
+            objdump -p target/release/rose-updater | grep NEEDED
+            exit 1
+          fi
+          echo "OK: no webkit linkage"

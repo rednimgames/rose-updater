@@ -139,6 +139,7 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
             &args.url,
             &args.manifest_name,
             &args.output,
+            &args.exe,
             progress_state.clone(),
         )
         .await

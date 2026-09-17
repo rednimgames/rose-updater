@@ -12,20 +12,42 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned, not ubuntu-latest: glibc is forward-compatible only, so the
+          # runner's glibc becomes the minimum a player needs. 24.04 ships 2.39;
+          # SteamOS has 2.41. ubuntu-latest drifting to 26.04 (glibc 2.43) would
+          # silently ship binaries that cannot start on the Deck.
+          - os: ubuntu-24.04
             name: linux-x64
+            needs_webkit: true
+            cargo_flags: ''
             archiver_binary: target/release/rose-updater-archiver
             archiver_asset: rose-updater-archiver-linux-x64
             updater_binary: target/release/rose-updater
             updater_asset: rose-updater-linux-x64
+          # SteamOS and other installs without libwebkit2gtk-4.1. Deliberately
+          # built without the webkit dev package: if the no-webview path ever
+          # pulls webkit back in, this job fails instead of shipping a binary
+          # that cannot start. Updater only, the archiver is not webview-aware.
+          - os: ubuntu-24.04
+            name: linux-x64-nowebview
+            needs_webkit: false
+            cargo_flags: '--no-default-features --bin rose-updater'
+            archiver_binary: ''
+            archiver_asset: ''
+            updater_binary: target/release/rose-updater
+            updater_asset: rose-updater-linux-x64-nowebview
           - os: macos-latest
             name: macos
+            needs_webkit: false
+            cargo_flags: ''
             archiver_binary: target/release/rose-updater-archiver
             archiver_asset: rose-updater-archiver-macos
             updater_binary: target/release/rose-updater
             updater_asset: rose-updater-macos
           - os: windows-latest
             name: windows-x64
+            needs_webkit: false
+            cargo_flags: ''
             archiver_binary: target/release/rose-updater-archiver.exe
             archiver_asset: rose-updater-archiver-windows-x64.exe
             updater_binary: target/release/rose-updater.exe
@@ -39,21 +61,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies (Ubuntu only)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.needs_webkit
         run: sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release ${{ matrix.cargo_flags }}
         env:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C link-arg=-weak_framework -C link-arg=ScreenCaptureKit -C link-arg=-weak_framework -C link-arg=UniformTypeIdentifiers' || '' }}
 
       - name: Rename assets
         shell: bash
         run: |
-          mv ${{ matrix.archiver_binary }} ${{ matrix.archiver_asset }}
           mv ${{ matrix.updater_binary }} ${{ matrix.updater_asset }}
+          if [ -n "${{ matrix.archiver_asset }}" ]; then
+            mv ${{ matrix.archiver_binary }} ${{ matrix.archiver_asset }}
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
