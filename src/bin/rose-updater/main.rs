@@ -44,7 +44,7 @@ pub mod headless;
 pub mod launch_button;
 pub mod progress_bar;
 
-const LOCAL_MANIFEST_VERSION: usize = 1;
+const LOCAL_MANIFEST_VERSION: usize = 2;
 
 const TEXT_FILE_EXTENSIONS: &[&str; 1] = &["xml"];
 
@@ -236,6 +236,7 @@ async fn update_updater(
     updater_output_path: &Path,
     remote_url: &Url,
     progress_state: ProgressState,
+    expected: &rose_update::manifest::RemoteManifestFileEntry,
 ) -> anyhow::Result<()> {
     info!("Updating updater");
 
@@ -243,6 +244,11 @@ async fn update_updater(
     let new_updater_temp_path = local_updater_path.with_extension("new");
 
     let mut archive_reader = init_remote_archive_reader(remote_url.clone()).await?;
+    anyhow::ensure!(
+        archive_reader.total_source_size() == expected.source_size as u64
+            && archive_reader.source_checksum().slice() == expected.source_hash.as_slice(),
+        "Updater archive does not match the selected manifest"
+    );
     let mut clone_output = init_local_clone_output(
         &archive_reader,
         &new_updater_temp_path,
@@ -251,6 +257,14 @@ async fn update_updater(
     .await?;
 
     clone_remote_file(&mut archive_reader, &mut clone_output, progress_state).await?;
+
+    drop(clone_output);
+    rose_update::verification::verify_file(
+        &new_updater_temp_path,
+        expected.source_size as u64,
+        &expected.source_hash,
+    )
+    .await?;
 
     // We cannot delete or modify a currently executing binary so we rename
     // the currently executing updater to allow us to download the new one
@@ -711,6 +725,8 @@ struct FileToDownload {
     local_path: String,
     /// Path to file at remote URL
     remote_path: String,
+    expected_hash: Vec<u8>,
+    expected_size: usize,
 }
 
 type VerifyCancelState = Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>;
@@ -814,6 +830,11 @@ async fn get_files_to_update(
     remote_manifest: &RemoteManifest,
     local_manifest: &LocalManifest,
 ) -> Vec<FileToDownload> {
+    // Version 1 could record manifest hashes without checking the installed bytes.
+    // Recheck every file once to repair installations affected by overlapping releases.
+    if local_manifest.version < LOCAL_MANIFEST_VERSION {
+        return build_full_file_list(remote_manifest);
+    }
     // Build a lookup table to make it easier to check local manifest values
     let mut local_manifest_data = HashMap::new();
     for entry in &local_manifest.files {
@@ -838,9 +859,28 @@ async fn get_files_to_update(
             return Some(FileToDownload {
                 local_path: entry.source_path.clone(),
                 remote_path: entry.path.clone(),
+                expected_hash: entry.source_hash.clone(),
+                expected_size: entry.source_size,
             });
         })
         .collect()
+}
+
+// In-place updates can fail after changing bytes. Remove their cached hashes first
+// so a retry or rollback cannot mistake partly written files for the old release.
+async fn invalidate_pending_files(
+    path: &Path,
+    local: &LocalManifest,
+    pending: &[FileToDownload],
+) -> anyhow::Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut checkpoint = local.clone();
+    checkpoint
+        .files
+        .retain(|entry| !pending.iter().any(|file| file.local_path == entry.path));
+    save_local_manifest(path, &checkpoint).await
 }
 
 /// Downloads/repairs files from remote. Returns the number of files that had chunks downloaded.
@@ -871,6 +911,16 @@ async fn get_remote_files(
         archive_readers?
     };
 
+    // Check every archive before modifying any installed file. A mutable URL may
+    // have changed after the manifest was fetched.
+    for (archive, expected) in archive_readers.iter().zip(files_to_update) {
+        anyhow::ensure!(
+            archive.total_source_size() == expected.expected_size as u64
+                && archive.source_checksum().slice() == expected.expected_hash.as_slice(),
+            "Archive does not match the selected manifest: {}",
+            expected.remote_path
+        );
+    }
     info!(count = archive_readers.len(), "Remote Archives Initialized");
 
     let local_file_paths: Vec<_> = files_to_update
@@ -1028,6 +1078,16 @@ async fn get_remote_files(
         }
     }
 
+    drop(clone_outputs);
+    for file in files_to_update {
+        rose_update::verification::verify_file(
+            &output_dir.join(&file.local_path),
+            file.expected_size as u64,
+            &file.expected_hash,
+        )
+        .await?;
+    }
+
     Ok(files_repaired)
 }
 
@@ -1039,6 +1099,8 @@ fn build_full_file_list(remote_manifest: &RemoteManifest) -> Vec<FileToDownload>
         .map(|entry| FileToDownload {
             local_path: entry.source_path.clone(),
             remote_path: entry.path.clone(),
+            expected_hash: entry.source_hash.clone(),
+            expected_size: entry.source_size,
         })
         .collect()
 }
@@ -1060,6 +1122,9 @@ async fn verify_and_repair(
 
     info!(count = all_files.len(), "Starting verification");
 
+    let local_manifest_path = local_manifest_path(output_dir, remote_url);
+    let local_manifest = get_or_create_local_manifest(&local_manifest_path).await?;
+    invalidate_pending_files(&local_manifest_path, &local_manifest, &all_files).await?;
     let files_repaired = get_remote_files(
         remote_url,
         &all_files,
@@ -1070,8 +1135,6 @@ async fn verify_and_repair(
     .await?;
 
     // Update local manifest to match remote after verification
-    let local_manifest_path = local_manifest_path(output_dir, remote_url);
-    let local_manifest = get_or_create_local_manifest(&local_manifest_path).await?;
     let new_local_manifest = build_local_manifest(&remote_manifest, local_manifest.updater);
     save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
@@ -1132,13 +1195,14 @@ async fn update_process(
             &updater_output_path,
             &remote,
             progress_state.clone(),
+            &remote_manifest.updater,
         )
         .await?;
 
         // We update the local manifest with only the data for the updater, the
         // rest of the data should be updated the next time we run the updater.
         let new_local_manifest = LocalManifest {
-            version: LOCAL_MANIFEST_VERSION,
+            version: local_manifest.version,
             updater: updater_manifest_entry(&remote_manifest),
             ..local_manifest
         };
@@ -1189,6 +1253,7 @@ async fn update_process(
         get_files_to_update(&args.output, &remote_manifest, &local_manifest).await
     };
 
+    invalidate_pending_files(&local_manifest_path, &local_manifest, &files_to_update).await?;
     get_remote_files(
         &remote_url,
         &files_to_update,
@@ -1989,5 +2054,42 @@ mod tests {
         assert!(should_remove_text_file(RemoteFilePass::update(), xml_path));
         assert!(!should_remove_text_file(RemoteFilePass::verify(), xml_path));
         assert!(!should_remove_text_file(RemoteFilePass::update(), bin_path));
+    }
+}
+
+#[cfg(test)]
+mod release_verification_tests {
+    use super::*;
+    use rose_update::manifest::RemoteManifestFileEntry;
+
+    #[tokio::test]
+    async fn old_manifest_rechecks_files_even_when_cached_hash_matches() {
+        let root = std::env::temp_dir().join(format!("rose-cache-test-{}", std::process::id()));
+        fs::create_dir_all(&root).await.unwrap();
+        fs::write(root.join("data.idx"), b"wrong release").await.unwrap();
+        let remote = RemoteManifest {
+            version: 1,
+            files: vec![RemoteManifestFileEntry {
+                path: "releases/new/data/data.idx.cba".into(),
+                source_path: "data.idx".into(), source_hash: vec![7; 64], source_size: 13,
+            }],
+            ..Default::default()
+        };
+        let mut local = build_local_manifest(&remote, Default::default());
+        local.version = 1;
+        let files = get_files_to_update(&root, &remote, &local).await;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].expected_hash, remote.files[0].source_hash);
+        assert_eq!(files[0].expected_size, 13);
+        assert_eq!(files[0].remote_path, "releases/new/data/data.idx.cba");
+        local.version = LOCAL_MANIFEST_VERSION;
+        let cache_path = root.join("local_manifest.json");
+        invalidate_pending_files(&cache_path, &local, &files).await.unwrap();
+        let checkpoint = get_or_create_local_manifest(&cache_path).await.unwrap();
+        assert!(checkpoint.files.is_empty());
+        assert_eq!(get_files_to_update(&root, &remote, &checkpoint).await.len(), 1);
+        fs::remove_file(cache_path).await.unwrap();
+        fs::remove_file(root.join("data.idx")).await.unwrap();
+        fs::remove_dir(root).await.unwrap();
     }
 }

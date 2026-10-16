@@ -36,6 +36,19 @@ only itself and then restart its new version to continue the update process.
 Once all the files have been synced, the local manifest will be updated at the
 cached location.
 
+Before changing installed files, the updater checks each archive's source size
+and checksum against the selected manifest. It also checks the completed files
+with BLAKE2b-512 before saving their hashes or allowing launch. Self-updates use
+the same checks before replacing the executable.
+
+Pending files are removed from the local cache before they are changed. Failed
+updates and rollbacks must check those files again. Version 1 local manifests
+trigger one full check because older updaters could record unverified hashes.
+
+Publish archives at immutable paths, such as `releases/<id>/data/rose.vfs.cba`.
+Update the public manifest only after all referenced files are available. Keep
+older paths available for clients that already downloaded an older manifest.
+
 Finally, the updater will launch the actual game after completing all the steps.
 
 For more information check use the `--help` commands the executables

@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+blake2 = "0.10.6"
 bitar = { version = "0.14.0", features = ["compress", "zstd-compression"] }
 clap = { version = "4.5.27", features = ["derive"] }
 directories = "6.0"

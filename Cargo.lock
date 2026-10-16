@@ -1988,6 +1988,7 @@ version = "0.4.4"
 dependencies = [
  "anyhow",
  "bitar",
+ "blake2",
  "clap",
  "directories",
  "fltk",
