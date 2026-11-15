@@ -49,6 +49,7 @@ struct Category {
 pub(super) enum NewsMessage {
     Articles(Vec<Article>),
     Image { index: usize, pixels: Vec<u8> },
+    Failed,
 }
 
 #[derive(Clone, Copy)]
@@ -264,6 +265,7 @@ pub(super) async fn load(sender: app::Sender<Message>) {
     if let Err(error) = load_feed(sender).await {
         // News is optional; never send a fatal updater error for a website failure.
         warn!(%error, "Unable to load launcher news");
+        sender.send(Message::News(NewsMessage::Failed));
     }
 }
 
@@ -465,6 +467,7 @@ fn set_hover(button: &mut Button, card: &Rc<RefCell<Card>>, hovered: bool) {
 
 pub(super) struct NewsPanel {
     pub group: Group,
+    status: Frame,
     cards: Vec<(Button, Rc<RefCell<Card>>)>,
 }
 
@@ -495,9 +498,16 @@ impl NewsPanel {
             logo.draw(frame.x() + 325, frame.y() + 10, 130, 80);
             draw::pop_clip();
         });
+        let mut status = Frame::new(10, 99, 760, 411, "Fetching latest news...");
+        status.set_frame(FrameType::NoBox);
+        status.set_align(Align::Inside | Align::Center);
+        status.set_label_font(REGULAR);
+        status.set_label_size(14);
+        status.set_label_color(Color::from_rgb(236, 231, 239));
         group.end();
         Self {
             group,
+            status,
             cards: Vec::new(),
         }
     }
@@ -505,6 +515,7 @@ impl NewsPanel {
     pub fn update(&mut self, message: NewsMessage) {
         match message {
             NewsMessage::Articles(articles) => {
+                self.status.hide();
                 self.group.begin();
                 for (index, article) in articles.into_iter().take(CARD_COUNT).enumerate() {
                     let rect = card_rect(index);
@@ -584,6 +595,10 @@ impl NewsPanel {
                         Err(error) => warn!(%error, "Unable to display news image"),
                     }
                 }
+            }
+            NewsMessage::Failed => {
+                self.status.set_label("Failed to fetch the latest news.");
+                self.status.show();
             }
         }
         self.group.redraw();
