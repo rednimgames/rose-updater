@@ -123,7 +123,9 @@ mod windows_impl {
         progress.set_max_progress(0);
         info!("Installing the Visual C++ runtime");
 
-        let bytes = reqwest::Client::new()
+        let bytes = rose_update::dns::client_builder()
+            .build()
+            .context("Setting up the runtime download failed")?
             .get(REDIST_URL)
             .timeout(std::time::Duration::from_secs(120))
             .send()

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tracing::info;
 
-use crate::error::ErrorCode;
+use crate::{dns, error::ErrorCode};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RemoteManifest {
@@ -156,7 +156,11 @@ pub async fn download_remote_manifest(
 
     info!(url=% remote_manifest_url.as_str(), "Downloading remote manifest");
 
-    let response = reqwest::get(remote_manifest_url)
+    let response = dns::client_builder()
+        .build()
+        .context(ErrorCode::SetupConnection.to_string())?
+        .get(remote_manifest_url)
+        .send()
         .await
         .context(ErrorCode::DownloadManifest.to_string())?;
 

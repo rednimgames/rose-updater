@@ -46,7 +46,7 @@ use futures::StreamExt;
 use tokio::fs;
 use tokio::sync::Semaphore;
 
-use crate::{dns::CloudflareResolver, error::ErrorCode, progress::ProgressState};
+use crate::{dns, error::ErrorCode, progress::ProgressState};
 
 pub type RemoteArchiveReader = bitar::Archive<bitar::archive_reader::HttpReader>;
 
@@ -73,9 +73,8 @@ fn cpu_semaphore() -> &'static Semaphore {
 
 /// Initiates a bitar archive reader for reading a remote archive over HTTP
 pub async fn init_remote_archive_reader(url: reqwest::Url) -> anyhow::Result<RemoteArchiveReader> {
-    let client = reqwest::ClientBuilder::new()
+    let client = dns::client_builder()
         .brotli(true)
-        .dns_resolver(CloudflareResolver::new())
         .build()
         .context(ErrorCode::SetupConnection.to_string())?
         .get(url.clone());

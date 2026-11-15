@@ -42,6 +42,21 @@ For more information check use the `--help` commands the executables
 
 ## Features
 
+### DNS fallback
+
+Manifest, archive, launcher news/image, and Visual C++ runtime downloads use
+public DNS in this order: Cloudflare (`1.1.1.1`), Google (`8.8.8.8`), then Google
+(`8.8.4.4`). Each server gets at most three seconds per lookup before the updater
+tries the next; lookup errors and missing records also trigger fallback. Both
+IPv4 and IPv6 destinations are supported, and successful answers are cached
+according to their DNS TTL.
+
+This policy applies inside the updater and does not change the computer's DNS
+settings. System/ISP DNS is not used as a fallback. Local hosts-file entries and
+IP-address URLs still work; private update hostnames must be listed in the hosts
+file or supplied as IP addresses. All-server failures are logged with the
+hostname and resolver errors. An HTTP proxy may resolve destination names itself.
+
 ### Windows Visual C++ runtime
 
 The Windows remote `manifest.json` can declare a minimum x64 runtime:
