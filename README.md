@@ -101,7 +101,8 @@ The original launcher artwork, font metrics, two-large/three-small news grid,
 and update controls are retained. Artwork and font sources are recorded in
 `res/NEWS-ASSETS.txt`. Fonts are bundled and loaded privately from the app cache.
 
-Linux builds still require FLTK's X11/Pango/Cairo libraries (see the packages in
+Linux builds still require FLTK's X11/Pango/Cairo libraries and Wayland development
+files for native dialogs (see the packages in
 `.github/workflows/ci.yaml`). Test release binaries on the intended Linux/SteamOS
 runtime, including Steam Deck Desktop and Gaming modes; a CI build alone does
 not validate window management, touch input, or game launch handoff.
