@@ -23,6 +23,8 @@ pub enum ErrorCode {
     DownloadArchive = 104,
     /// Chunk stream error
     DownloadChunk = 105,
+    /// News feed HTTP request or response transfer failed
+    FetchNews = 106,
 
     // File system (2xx)
     /// Output dir creation failed
@@ -86,6 +88,7 @@ impl ErrorCode {
             Self::SetupConnection => "Could not set up the download connection",
             Self::DownloadArchive => "Could not download game data",
             Self::DownloadChunk => "Failed to download a game file chunk",
+            Self::FetchNews => "Failed to fetch the latest news",
 
             Self::CreateGameFolder => "Could not create the game folder",
             Self::ReadLocalData => "Could not read local update data",

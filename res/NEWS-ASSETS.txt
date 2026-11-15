@@ -1,0 +1,19 @@
+Native launcher news assets
+
+news-background.webp and news-logo.webp are the original ROSE launcher artwork:
+https://www.roseonlinegame.com/images/launcher-bg.webp
+https://www.roseonlinegame.com/images/launcher-logo.webp
+
+ROSENews-Regular.ttf and ROSENews-Bold.ttf use the same Josefin Sans 2.001
+outlines as the launcher website's 400/700 font faces:
+https://cdn.jsdelivr.net/fontsource/fonts/josefin-sans@5.3.0/latin-400-normal.woff2
+https://cdn.jsdelivr.net/fontsource/fonts/josefin-sans@5.3.0/latin-700-normal.woff2
+
+The WOFF2 files were decompressed to TrueType with fontTools for FLTK's native
+font loader. The converted family is named "ROSE News" to respect the reserved
+font name. Font outlines and metrics are unchanged. The SIL Open Font License
+is embedded in each font's name table and reproduced in JosefinSans-OFL.txt.
+
+Layout reference: https://www.roseonlinegame.com/launcher.html
+Stylesheet: /css/launcher.css?id=92bc7b39042203793e7dfafdd802cc7e
+Retrieved November 15, 2026.

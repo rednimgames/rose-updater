@@ -16,7 +16,6 @@ use directories::ProjectDirs;
 use fltk::frame::Frame;
 use fltk::image::PngImage;
 use fltk::{enums::*, prelude::*, *};
-use fltk_webview::FromFltkWindow;
 use reqwest::Url;
 use rose_update::error::ErrorCode;
 use rose_update::progress::{ProgressStage, ProgressState};
@@ -42,6 +41,7 @@ use rose_update::manifest::{
 
 pub mod headless;
 pub mod launch_button;
+mod news;
 pub mod progress_bar;
 pub mod vc_runtime;
 
@@ -1316,6 +1316,7 @@ async fn complete_gui_operation(
 
 #[derive(Debug)]
 enum Message {
+    News(news::NewsMessage),
     Shutdown,
     Error {
         message: String,
@@ -1421,6 +1422,7 @@ async fn main() -> process::ExitCode {
         );
     });
 
+    let mut news_panel = news::NewsPanel::new();
     let mut main_progress_bar = progress_bar::ProgressBar::new(12, 547);
 
     let mut launch_button = launch_button::LaunchButton::new(572, 547);
@@ -1504,8 +1506,7 @@ async fn main() -> process::ExitCode {
         }
     });
 
-    // Social links: brand buttons on a plate, top right, in a strip above the
-    // news webview.
+    // Social links: brand buttons on a plate in the top-right header.
     let mut social_group = group::Group::new(657, 3, 112, 38, None);
     let mut plate = Frame::new(657, 3, 112, 38, None);
     let mut plate_image = PngImage::from_data(include_bytes!("../../../res/social-plate.png")).unwrap();
@@ -1567,11 +1568,6 @@ async fn main() -> process::ExitCode {
     }
     social_group.end();
 
-    let mut webview_win = window::Window::default().with_size(780, 488).with_pos(0, 42);
-    webview_win.set_border(false);
-    webview_win.set_frame(FrameType::NoBox);
-    webview_win.make_resizable(false);
-
     match image::PngImage::from_data(icon_bytes) {
         Ok(icon) => win.set_icon(Some(icon)),
         Err(e) => error!("Failed to load window icon: {}", e),
@@ -1580,59 +1576,13 @@ async fn main() -> process::ExitCode {
     win.end();
     win.show();
 
-    // Script used in the webview to force links to be opened in the native
-    // browser rather than in the webview.
-    let script = "
-    window.onload = function() {
-        const links = document.getElementsByTagName('a');
-        for (const link of links) {
-            link.onclick = function() {
-                open_url(link.href);
-                return false; // prevent default
-            }
-        }
-    };
-    ";
-
-    // Some Linux GPU/driver combos render the webview blank. Deliberately the
-    // broad fix: WEBKIT_DISABLE_DMABUF_RENDERER only covers NVIDIA/XWayland.
-    #[cfg(target_os = "linux")]
-    std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-
-    // Create the webview
-    let webview = fltk_webview::Webview::create(false, &mut webview_win);
-    if let Err(e) = webview.bind("open_url", |_, content| {
-        let parsed: serde_json::Value = match serde_json::from_str(content) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Failed to parse webview callback data: {}", e);
-                return;
-            }
-        };
-
-        // Open the url in the native browser
-        let url = parsed.get(0).and_then(|url_param| url_param.as_str());
-        if let Some(url) = url {
-            info!("Opening url in native browser: {}", url);
-            if let Err(e) = open::that(url) {
-                error!("Failed to open URL in browser: {}", e);
-            }
-        }
-    }) {
-        error!("Failed to bind webview callback: {}", e);
-    }
-    if let Err(e) = webview.init(script) {
-        error!("Failed to initialize webview: {}", e);
-    }
-    if let Err(e) = webview.navigate("https://roseonlinegame.com/launcher.html") {
-        error!("Failed to navigate webview: {}", e);
-    }
-
     // general channel
     let (app_message_sender, app_message_receiver) = app::channel::<Message>();
 
     // shutdown channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let news_task = tokio::spawn(news::load(app_message_sender));
 
     // verify cancellation channel
     let verify_cancel_tx: VerifyCancelState = Arc::new(tokio::sync::Mutex::new(None));
@@ -1805,10 +1755,13 @@ async fn main() -> process::ExitCode {
 
     let mut runtime_ready = false;
     'event_loop: while app.wait() {
-        // RuntimeStarted and OperationComplete can arrive in the same wakeup
-        // when no installation is needed. Drain both before waiting again.
+        // News images and runtime/update completions can share one FLTK wake-up.
         while let Some(e) = app_message_receiver.recv() {
             match e {
+                Message::News(message) => {
+                    news_panel.update(message);
+                    social_group.redraw();
+                }
                 Message::Shutdown => {
                     info!("Shutting down");
                     break 'event_loop;
@@ -1914,6 +1867,7 @@ async fn main() -> process::ExitCode {
             // To reset the progress bar area we need to redraw the background
             // and then draw the progress bar on top of it
             background_frame.redraw();
+            news_panel.group.redraw();
             main_progress_bar.redraw();
 
             // We need to redraw the buttons ontop of the background frame after
@@ -1938,6 +1892,7 @@ async fn main() -> process::ExitCode {
 
     info!("Sending shutdown signal");
     let _ = shutdown_tx.send(true);
+    news_task.abort();
     // Do not drop a runtime-installation future at Tokio shutdown. File work
     // observes shutdown above; an installer already started is awaited normally.
     let tasks = std::mem::take(&mut *operation_tasks.borrow_mut());

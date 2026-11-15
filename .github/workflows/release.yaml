@@ -40,12 +40,13 @@ jobs:
 
       - name: Install dependencies (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt update && sudo apt install -y libwebkit2gtk-4.1-dev
+        # rfd's native dialogs also need Wayland, formerly pulled in by WebKitGTK.
+        run: sudo apt update && sudo apt install -y libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev libxrender-dev libxfixes-dev libpango1.0-dev libgl1-mesa-dev libglu1-mesa-dev libwayland-dev
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
         env:
           RUSTFLAGS: ${{ matrix.os == 'macos-latest' && '-C link-arg=-weak_framework -C link-arg=ScreenCaptureKit -C link-arg=-weak_framework -C link-arg=UniformTypeIdentifiers' || '' }}
 
