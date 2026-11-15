@@ -43,6 +43,7 @@ use rose_update::manifest::{
 pub mod headless;
 pub mod launch_button;
 pub mod progress_bar;
+pub mod vc_runtime;
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
 
@@ -1249,7 +1250,10 @@ enum Message {
     Shutdown,
     Error { message: String, details: String },
     VerifyStarted,
-    VerifyComplete { repaired: usize },
+    VerifyComplete {
+        repaired: usize,
+        runtime_note: Option<String>,
+    },
     VerifyCancelled,
     VerifyFailed(String),
 }
@@ -1641,12 +1645,16 @@ async fn main() -> process::ExitCode {
                 }
 
                 let result = tokio::select! {
-                    res = run_verify_process(
-                        &verify_url,
-                        &verify_manifest_name,
-                        &verify_output,
-                        progress_state,
-                    ) => res,
+                    res = async {
+                        let repaired = run_verify_process(
+                            &verify_url,
+                            &verify_manifest_name,
+                            &verify_output,
+                            progress_state,
+                        )
+                        .await?;
+                        anyhow::Ok((repaired, vc_runtime::repair().await))
+                    } => res,
                     _ = cancel_recv.changed() => {
                         info!("Verification cancelled by user");
                         app_message_sender.send(Message::VerifyCancelled);
@@ -1664,8 +1672,11 @@ async fn main() -> process::ExitCode {
                 }
 
                 match result {
-                    Ok(repaired) => {
-                        app_message_sender.send(Message::VerifyComplete { repaired });
+                    Ok((repaired, runtime_note)) => {
+                        app_message_sender.send(Message::VerifyComplete {
+                            repaired,
+                            runtime_note,
+                        });
                     }
                     Err(e) => {
                         error!("Verification failed: {}", e);
@@ -1701,7 +1712,10 @@ async fn main() -> process::ExitCode {
 
                 match result {
                     Ok(repaired) => {
-                        app_message_sender.send(Message::VerifyComplete { repaired });
+                        app_message_sender.send(Message::VerifyComplete {
+                            repaired,
+                            runtime_note: None,
+                        });
                     }
                     Err(e) => {
                         error!("Verification failed: {}", e);
@@ -1773,15 +1787,21 @@ async fn main() -> process::ExitCode {
                     launch_button.deactivate();
                     launch_button.redraw();
                 }
-                Message::VerifyComplete { repaired } => {
+                Message::VerifyComplete {
+                    repaired,
+                    runtime_note,
+                } => {
                     info!(repaired, "Verification complete");
                     restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
 
-                    let message = if repaired == 0 {
+                    let mut message = if repaired == 0 {
                         "All files verified successfully".to_string()
                     } else {
                         format!("Repaired {} file(s)", repaired)
                     };
+                    if let Some(note) = runtime_note {
+                        message = format!("{}\n\n{}", message, note);
+                    }
 
                     rfd::MessageDialog::new()
                         .set_level(rfd::MessageLevel::Info)
