@@ -275,7 +275,7 @@ pub(super) async fn load(sender: app::Sender<Message>) {
 }
 
 async fn load_feed(sender: app::Sender<Message>) -> anyhow::Result<()> {
-    let client = Client::builder()
+    let client = rose_update::dns::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .context(ErrorCode::SetupConnection)?;
