@@ -207,7 +207,7 @@ mod windows_impl {
                 anyhow::bail!("the installer did not start");
             }
             if WaitForSingleObject(info.hProcess, INFINITE) != WAIT_OBJECT_0 {
-                let error = windows::core::Error::from_win32();
+                let error = windows::core::Error::from_thread();
                 let _ = CloseHandle(info.hProcess);
                 return Err(error.into());
             }
