@@ -50,9 +50,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run rose-updater tests (Windows only)
+      - name: Run tests (Windows only)
         if: matrix.os == 'windows-latest'
-        run: cargo test --bin rose-updater
+        run: cargo test --all-targets
 
       - name: Build in release mode
         run: cargo build --release

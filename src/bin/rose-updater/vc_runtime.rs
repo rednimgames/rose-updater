@@ -1,45 +1,89 @@
-//! Microsoft Visual C++ runtime step of the Repair button.
-//!
-//! The game refuses to start when msvcp140.dll is older than the toolset it was
-//! built with, so Repair installs the current x64 redistributable when the
-//! system copy is missing or older than that.
+//! Manifest-driven Windows Visual C++ runtime prerequisite.
 
-/// Oldest runtime the game accepts: the VS 2022 (v143) 14.44 toolset the client
-/// is built with. Keep in step with `vc_runtime_is_current` in the client.
-#[cfg_attr(not(windows), allow(dead_code))]
-const REQUIRED_VERSION: (u16, u16) = (14, 44);
+use rose_update::manifest::RuntimeVersion;
+use rose_update::progress::ProgressState;
 
-#[cfg_attr(not(windows), allow(dead_code))]
-fn is_current(version: (u16, u16)) -> bool {
-    version >= REQUIRED_VERSION
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    UpToDate,
+    Installed,
+    RestartRequired,
 }
 
-/// Installs the runtime if needed and returns a line for the Repair dialog,
-/// or `None` when nothing had to change.
-#[cfg(windows)]
-pub async fn repair() -> Option<String> {
-    match windows_impl::ensure_installed().await {
-        Ok(windows_impl::Outcome::UpToDate) => None,
-        Ok(windows_impl::Outcome::Installed) => {
-            Some("Installed the Microsoft Visual C++ Redistributable.".to_string())
+impl Outcome {
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Self::UpToDate => None,
+            Self::Installed => Some("Installed the Microsoft Visual C++ Redistributable."),
+            Self::RestartRequired => Some("Installed the Microsoft Visual C++ Redistributable. Restart your computer before playing."),
         }
-        Ok(windows_impl::Outcome::RestartRequired) => Some(
-            "Installed the Microsoft Visual C++ Redistributable. Restart your computer before playing."
-                .to_string(),
-        ),
-        Err(error) => {
-            tracing::error!("Visual C++ runtime install failed: {:#}", error);
-            Some(format!(
-                "Couldn't install the Microsoft Visual C++ Redistributable: {}",
-                error
-            ))
-        }
+    }
+
+    pub fn ready_to_play(self) -> bool {
+        self != Self::RestartRequired
     }
 }
 
-#[cfg(not(windows))]
-pub async fn repair() -> Option<String> {
-    None
+/// Must be awaited outside the cancellable file-download/verification phase.
+pub async fn ensure_installed(
+    required: Option<RuntimeVersion>,
+    progress: ProgressState,
+) -> anyhow::Result<Outcome> {
+    #[cfg(windows)]
+    {
+        use anyhow::Context;
+        windows_impl::ensure_installed(required, progress)
+            .await
+            .context("Couldn't install the required Microsoft Visual C++ Redistributable")
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (required, progress);
+        Ok(Outcome::UpToDate)
+    }
+}
+
+// Keep the decision and post-install verification testable without elevation.
+#[cfg(any(windows, test))]
+async fn ensure_with<F, I, R>(
+    required: Option<RuntimeVersion>,
+    mut installed_version: F,
+    install: I,
+) -> anyhow::Result<Outcome>
+where
+    F: FnMut() -> Option<RuntimeVersion>,
+    I: FnOnce() -> R,
+    R: std::future::Future<Output = anyhow::Result<u32>>,
+{
+    let Some(required) = required else {
+        return Ok(Outcome::UpToDate);
+    };
+    if installed_version().is_some_and(|version| version >= required) {
+        return Ok(Outcome::UpToDate);
+    }
+
+    let exit_code = install().await?;
+    tracing::info!(exit_code, "Visual C++ redistributable installer finished");
+    match exit_code {
+        // A replacement DLL may only take effect on reboot.
+        1641 | 3010 => Ok(Outcome::RestartRequired),
+        // Burn can also return HRESULT_FROM_WIN32(ERROR_PRODUCT_VERSION).
+        0 | 1638 | 0x80070666 => {
+            let actual = installed_version();
+            if !actual.is_some_and(|version| version >= required) {
+                anyhow::bail!(
+                    "The installer exited with code {}, but the runtime is still missing or older than {}. Repair the Microsoft Visual C++ Redistributable in Windows Installed apps, then try again.",
+                    exit_code, required
+                );
+            }
+            Ok(if exit_code == 0 {
+                Outcome::Installed
+            } else {
+                Outcome::UpToDate
+            })
+        }
+        code => anyhow::bail!("The runtime installer exited with code {}", code),
+    }
 }
 
 #[cfg(windows)]
@@ -49,9 +93,9 @@ mod windows_impl {
     use std::path::{Path, PathBuf};
 
     use anyhow::Context;
-    use tracing::{info, warn};
+    use tracing::info;
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows::Win32::Storage::FileSystem::{
         GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
     };
@@ -60,54 +104,53 @@ mod windows_impl {
         ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
 
-    use super::is_current;
+    use super::{ensure_with, Outcome};
+    use rose_update::manifest::RuntimeVersion;
+    use rose_update::progress::{ProgressStage, ProgressState};
 
-    const REDIST_URL: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+    const REDIST_URL: &str = "https://aka.ms/vc14/vc_redist.x64.exe";
 
-    #[derive(Debug)]
-    pub enum Outcome {
-        UpToDate,
-        Installed,
-        RestartRequired,
+    pub async fn ensure_installed(
+        required: Option<RuntimeVersion>,
+        progress: ProgressState,
+    ) -> anyhow::Result<Outcome> {
+        ensure_with(required, installed_version, || install(progress)).await
     }
 
-    pub async fn ensure_installed() -> anyhow::Result<Outcome> {
-        let version = installed_version();
-        if let Some(version) = version.filter(|v| is_current(*v)) {
-            info!(?version, "Visual C++ runtime is up to date");
-            return Ok(Outcome::UpToDate);
-        }
-        info!(?version, "Installing the Visual C++ runtime");
+    async fn install(progress: ProgressState) -> anyhow::Result<u32> {
+        progress.set_stage(ProgressStage::InstallingRuntime);
+        progress.set_current_progress(0);
+        progress.set_max_progress(0);
+        info!("Installing the Visual C++ runtime");
 
-        let bytes = reqwest::get(REDIST_URL)
+        let bytes = reqwest::Client::new()
+            .get(REDIST_URL)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
             .await
             .and_then(|response| response.error_for_status())
             .context("Download failed")?
             .bytes()
             .await
             .context("Download failed")?;
-        let installer = std::env::temp_dir().join("rose-vc_redist.x64.exe");
-        tokio::fs::write(&installer, &bytes).await?;
-
-        let run_path = installer.clone();
-        let exit_code = tokio::task::spawn_blocking(move || run_elevated(&run_path)).await??;
-        let _ = tokio::fs::remove_file(&installer).await;
-
-        info!(exit_code, "Visual C++ redistributable installer finished");
-        match exit_code {
-            0 => Ok(Outcome::Installed),
-            1641 | 3010 => Ok(Outcome::RestartRequired),
-            // A newer runtime is already registered; nothing more the installer can do.
-            1638 => {
-                warn!("Visual C++ redistributable reports a newer version is already installed");
-                Ok(Outcome::UpToDate)
-            }
-            code => anyhow::bail!("the installer exited with code {}", code),
-        }
+        // Separate concurrent launchers, and clean up on both failure and success.
+        // The blocking task owns the directory until the installer has exited.
+        let directory = tempfile::Builder::new()
+            .prefix("rose-vc-runtime-")
+            .tempdir()?;
+        let installer = directory.path().join("vc_redist.x64.exe");
+        tokio::fs::write(&installer, &bytes)
+            .await
+            .context("Saving the runtime installer failed")?;
+        tokio::task::spawn_blocking(move || {
+            let _directory = directory;
+            run_elevated(&installer)
+        })
+        .await?
     }
 
     /// Version of the 64-bit msvcp140.dll in System32, the copy the game loads.
-    fn installed_version() -> Option<(u16, u16)> {
+    fn installed_version() -> Option<RuntimeVersion> {
         let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
         let dll = PathBuf::from(system_root)
             .join("System32")
@@ -133,14 +176,17 @@ mod windows_impl {
             )
             .as_bool()
                 || info.is_null()
+                || length < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
             {
                 return None;
             }
-            let info = &*(info as *const VS_FIXEDFILEINFO);
-            Some((
+            let info = std::ptr::read_unaligned(info as *const VS_FIXEDFILEINFO);
+            Some(RuntimeVersion([
                 (info.dwFileVersionMS >> 16) as u16,
                 info.dwFileVersionMS as u16,
-            ))
+                (info.dwFileVersionLS >> 16) as u16,
+                info.dwFileVersionLS as u16,
+            ]))
         }
     }
 
@@ -160,7 +206,11 @@ mod windows_impl {
             if info.hProcess.is_invalid() {
                 anyhow::bail!("the installer did not start");
             }
-            WaitForSingleObject(info.hProcess, INFINITE);
+            if WaitForSingleObject(info.hProcess, INFINITE) != WAIT_OBJECT_0 {
+                let error = windows::core::Error::from_win32();
+                let _ = CloseHandle(info.hProcess);
+                return Err(error.into());
+            }
             let mut exit_code = 0u32;
             let result = GetExitCodeProcess(info.hProcess, &mut exit_code);
             let _ = CloseHandle(info.hProcess);
@@ -177,18 +227,102 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
-    #[test]
-    fn accepts_the_required_runtime_and_newer() {
-        assert!(is_current((14, 44)));
-        assert!(is_current((14, 50)));
-        assert!(is_current((15, 0)));
+    fn version(value: &str) -> RuntimeVersion {
+        value.parse().unwrap()
     }
 
-    #[test]
-    fn rejects_older_runtimes() {
-        assert!(!is_current((14, 43)));
-        assert!(!is_current((14, 0)));
-        assert!(!is_current((12, 99)));
+    #[tokio::test]
+    async fn no_requirement_or_current_runtime_never_runs_an_installer() {
+        for required in [None, Some(version("14.44")), Some(version("14.50"))] {
+            let result = ensure_with(
+                required,
+                || Some(version("14.50")),
+                || async { panic!("must not download or elevate when already current") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Outcome::UpToDate);
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_bump_and_missing_runtime_trigger_installation() {
+        for before in [None, Some(version("14.44"))] {
+            let current = Cell::new(before);
+            let result = ensure_with(
+                Some(version("14.50")),
+                || current.get(),
+                || async {
+                    current.set(Some(version("14.50")));
+                    Ok(0)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Outcome::Installed);
+        }
+    }
+
+    #[tokio::test]
+    async fn success_or_registered_newer_version_must_satisfy_the_dll_check() {
+        for code in [0, 1638, 0x80070666] {
+            for actual in [None, Some(version("14.43"))] {
+                let result =
+                    ensure_with(Some(version("14.44")), || actual, || async { Ok(code) }).await;
+                assert!(result.is_err(), "code {code}, DLL {actual:?}");
+            }
+        }
+        for code in [1638, 0x80070666] {
+            let current = Cell::new(Some(version("14.43")));
+            let result = ensure_with(
+                Some(version("14.44")),
+                || current.get(),
+                || async {
+                    current.set(Some(version("14.50")));
+                    Ok(code)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Outcome::UpToDate);
+        }
+    }
+
+    #[tokio::test]
+    async fn installer_failures_and_reboots_are_not_ready_to_play() {
+        for code in [3010, 1641] {
+            let result = ensure_with(Some(version("14.44")), || None, || async { Ok(code) })
+                .await
+                .unwrap();
+            assert_eq!(result, Outcome::RestartRequired);
+            assert!(!result.ready_to_play());
+            assert!(result.note().unwrap().contains("Restart"));
+        }
+        assert!(
+            ensure_with(Some(version("14.44")), || None, || async { Ok(1603) })
+                .await
+                .is_err()
+        );
+        let error = ensure_with(
+            Some(version("14.44")),
+            || None,
+            || async { anyhow::bail!("UAC declined") },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("UAC declined"));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn non_windows_ignores_windows_prerequisites() {
+        assert_eq!(
+            ensure_installed(Some(version("99.0")), ProgressState::default())
+                .await
+                .unwrap(),
+            Outcome::UpToDate
+        );
     }
 }

@@ -37,7 +37,7 @@ use rose_update::clone::{
 };
 use rose_update::manifest::{
     download_remote_manifest, get_or_create_local_manifest, save_local_manifest, LocalManifest,
-    LocalManifestFileEntry, RemoteManifest,
+    LocalManifestFileEntry, RemoteManifest, RuntimeVersion,
 };
 
 pub mod headless;
@@ -161,8 +161,16 @@ impl Args {
     }
 }
 
+#[derive(Debug)]
+struct FileProcessResult {
+    // None for updates; Some(count) for an explicit verification.
+    repaired: Option<usize>,
+    vc_runtime_min_version: Option<RuntimeVersion>,
+}
+
+#[derive(Debug)]
 enum UpdateProcessResult {
-    ApplicationUpdated,
+    ApplicationUpdated(FileProcessResult),
     UpdaterUpdated,
 }
 
@@ -803,7 +811,7 @@ async fn run_verify_process(
     manifest_name: &str,
     output_dir: &Path,
     progress_state: ProgressState,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<FileProcessResult> {
     let remote_url = parse_remote_url(verify_url)?;
 
     verify_and_repair(&remote_url, manifest_name, output_dir, progress_state).await
@@ -1045,13 +1053,13 @@ fn build_full_file_list(remote_manifest: &RemoteManifest) -> Vec<FileToDownload>
 }
 
 /// Verify all files against the remote manifest and repair any that are corrupted.
-/// Returns the number of files that were repaired.
+/// Returns the repaired count and the prerequisite from the same remote manifest.
 async fn verify_and_repair(
     remote_url: &Url,
     manifest_name: &str,
     output_dir: &Path,
     progress_state: ProgressState,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<FileProcessResult> {
     progress_state.set_stage(ProgressStage::FetchingMetadata);
     progress_state.set_current_progress(0);
     progress_state.set_max_progress(0);
@@ -1078,7 +1086,10 @@ async fn verify_and_repair(
 
     info!(files_repaired, "Verification complete");
 
-    Ok(files_repaired)
+    Ok(FileProcessResult {
+        repaired: Some(files_repaired),
+        vc_runtime_min_version: remote_manifest.vc_runtime_min_version,
+    })
 }
 
 async fn update_process(
@@ -1241,18 +1252,80 @@ async fn update_process(
 
     save_local_manifest(&local_manifest_path, &new_local_manifest).await?;
 
-    Ok(UpdateProcessResult::ApplicationUpdated)
+    Ok(UpdateProcessResult::ApplicationUpdated(FileProcessResult {
+        repaired: None,
+        vc_runtime_min_version: remote_manifest.vc_runtime_min_version,
+    }))
+}
+
+async fn run_file_process(
+    args: &Args,
+    progress: ProgressState,
+) -> anyhow::Result<UpdateProcessResult> {
+    if args.verify {
+        run_verify_process(&args.url, &args.manifest_name, &args.output, progress)
+            .await
+            .map(UpdateProcessResult::ApplicationUpdated)
+    } else {
+        update_process(args, progress).await
+    }
+}
+
+/// Only file work can be cancelled. Once it completes, always await the runtime
+/// installer and report its result, even if Stop/shutdown arrives in that phase.
+async fn run_cancellable_files<T, U, F, C, Finish, Completion>(
+    files: F,
+    cancel: C,
+    finish: Finish,
+) -> Option<anyhow::Result<U>>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+    C: std::future::Future,
+    Finish: FnOnce(T) -> Completion,
+    Completion: std::future::Future<Output = anyhow::Result<U>>,
+{
+    let files = tokio::select! {
+        biased;
+        _ = cancel => return None,
+        result = files => result,
+    };
+    Some(match files {
+        Ok(files) => finish(files).await,
+        Err(error) => Err(error),
+    })
+}
+
+async fn complete_gui_operation(
+    files: FileProcessResult,
+    progress: ProgressState,
+    sender: app::Sender<Message>,
+) {
+    sender.send(Message::RuntimeStarted);
+    let runtime = vc_runtime::ensure_installed(files.vc_runtime_min_version, progress)
+        .await
+        .map_err(|error| format!("{error:#}"));
+    match &runtime {
+        Ok(outcome) => info!(?outcome, "Runtime prerequisite check complete"),
+        Err(error) => error!(%error, "Runtime prerequisite check failed"),
+    }
+    sender.send(Message::OperationComplete {
+        repaired: files.repaired,
+        runtime,
+    });
 }
 
 #[derive(Debug)]
 enum Message {
-    Launch,
     Shutdown,
-    Error { message: String, details: String },
+    Error {
+        message: String,
+        details: String,
+    },
     VerifyStarted,
-    VerifyComplete {
-        repaired: usize,
-        runtime_note: Option<String>,
+    RuntimeStarted,
+    OperationComplete {
+        repaired: Option<usize>,
+        runtime: Result<vc_runtime::Outcome, String>,
     },
     VerifyCancelled,
     VerifyFailed(String),
@@ -1262,8 +1335,13 @@ fn restore_ready_state(
     launch_button: &mut launch_button::LaunchButton,
     verify_button: &mut button::Button,
     progress_state: &ProgressState,
+    runtime_ready: bool,
 ) {
-    launch_button.activate();
+    if runtime_ready {
+        launch_button.activate();
+    } else {
+        launch_button.deactivate();
+    }
     launch_button.change_state(launch_button::LaunchButtonState::Play);
     launch_button.redraw();
 
@@ -1272,7 +1350,11 @@ fn restore_ready_state(
     verify_button.show();
     verify_button.redraw();
 
-    progress_state.set_stage(ProgressStage::Play);
+    progress_state.set_stage(if runtime_ready {
+        ProgressStage::Play
+    } else {
+        ProgressStage::None
+    });
 }
 
 #[tokio::main]
@@ -1557,6 +1639,7 @@ async fn main() -> process::ExitCode {
 
     // Create our updaters
     let progress_state = ProgressState::default();
+    let operation_tasks = Rc::new(RefCell::new(Vec::new()));
 
     // Clone some args before moving args into download task
     let exe = args.exe.clone();
@@ -1607,6 +1690,8 @@ async fn main() -> process::ExitCode {
         let verify_url = verify_url.clone();
         let verify_manifest_name = verify_manifest_name.clone();
         let verify_output = verify_output.clone();
+        let operation_tasks = operation_tasks.clone();
+        let shutdown_rx = shutdown_rx.clone();
 
         verify_button.set_callback(move |btn| {
             let cancel_tx = verify_cancel_tx.clone();
@@ -1637,139 +1722,96 @@ async fn main() -> process::ExitCode {
 
             let (cancel_send, mut cancel_recv) = tokio::sync::watch::channel(false);
             let cancel_tx_clone = cancel_tx.clone();
-            tokio::spawn(async move {
-                // Store the cancel sender so the Stop button can use it
+            let mut shutdown_rx = shutdown_rx.clone();
+            let task = tokio::spawn(async move {
                 {
                     let mut guard = cancel_tx_clone.lock().await;
                     *guard = Some(cancel_send);
                 }
 
-                let result = tokio::select! {
-                    res = async {
-                        let repaired = run_verify_process(
-                            &verify_url,
-                            &verify_manifest_name,
-                            &verify_output,
-                            progress_state,
-                        )
-                        .await?;
-                        anyhow::Ok((repaired, vc_runtime::repair().await))
-                    } => res,
-                    _ = cancel_recv.changed() => {
-                        info!("Verification cancelled by user");
-                        app_message_sender.send(Message::VerifyCancelled);
-                        // Clear the cancel sender
-                        let mut guard = cancel_tx_clone.lock().await;
-                        *guard = None;
-                        return;
-                    }
-                };
-
-                // Clear the cancel sender
-                {
-                    let mut guard = cancel_tx_clone.lock().await;
-                    *guard = None;
-                }
+                let result = run_cancellable_files(
+                    run_verify_process(
+                        &verify_url,
+                        &verify_manifest_name,
+                        &verify_output,
+                        progress_state.clone(),
+                    ),
+                    async {
+                        tokio::select! {
+                            _ = cancel_recv.changed() => {},
+                            _ = shutdown_rx.changed() => {},
+                        }
+                    },
+                    |files| async {
+                        // Ignore any late Stop clicks before the UI disables the button.
+                        *cancel_tx_clone.lock().await = None;
+                        complete_gui_operation(files, progress_state, app_message_sender).await;
+                        Ok(())
+                    },
+                )
+                .await;
+                *cancel_tx_clone.lock().await = None;
 
                 match result {
-                    Ok((repaired, runtime_note)) => {
-                        app_message_sender.send(Message::VerifyComplete {
-                            repaired,
-                            runtime_note,
-                        });
-                    }
-                    Err(e) => {
-                        error!("Verification failed: {}", e);
-                        app_message_sender
-                            .send(Message::VerifyFailed(format!("Verification failed: {}", e)));
+                    None => app_message_sender.send(Message::VerifyCancelled),
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        error!("Verification failed: {error:#}");
+                        app_message_sender.send(Message::VerifyFailed(format!(
+                            "Verification failed: {error:#}"
+                        )));
                     }
                 }
             });
+            operation_tasks
+                .borrow_mut()
+                .retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+            operation_tasks.borrow_mut().push(task);
         });
     }
 
-    // Spawn a task to download our updates (or verify only if --verify flag is set)
-    let _ = {
+    // Initial install, ordinary update and --verify all finish with the same
+    // manifest-driven runtime check, including updates with no changed files.
+    let startup_task = {
         let progress_state = progress_state.clone();
         let mut shutdown_rx = shutdown_rx.clone();
-        let verify_only = args.verify;
-        let verify_url_for_task = args.url.clone();
-        let verify_manifest_for_task = args.manifest_name.clone();
-        let verify_output_for_task = args.output.clone();
-
         tokio::spawn(async move {
-            if verify_only {
-                // --verify flag: skip update, go straight to verify+repair
-                let result = tokio::select! {
-                    res = run_verify_process(
-                        &verify_url_for_task,
-                        &verify_manifest_for_task,
-                        &verify_output_for_task,
-                        progress_state,
-                    ) => res,
-                    _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Verification cancelled"))
-                };
-
-                match result {
-                    Ok(repaired) => {
-                        app_message_sender.send(Message::VerifyComplete {
-                            repaired,
-                            runtime_note: None,
-                        });
+            let result = run_cancellable_files(
+                run_file_process(&args, progress_state.clone()),
+                shutdown_rx.changed(),
+                |result| async {
+                    match result {
+                        UpdateProcessResult::ApplicationUpdated(files) => {
+                            complete_gui_operation(files, progress_state, app_message_sender).await;
+                        }
+                        UpdateProcessResult::UpdaterUpdated => {
+                            app_message_sender.send(Message::Shutdown);
+                        }
                     }
-                    Err(e) => {
-                        error!("Verification failed: {}", e);
-                        app_message_sender.send(Message::Error {
-                            message: e.to_string(),
-                            details: format!("{:#}", e),
-                        });
-                    }
-                }
-                return;
-            }
-
-            let result = tokio::select! {
-                res = update_process(&args, progress_state) => res,
-                _ = shutdown_rx.changed() => Err(anyhow::anyhow!("Download cancelled"))
-            };
-
-            if let Ok(download_result) = result {
-                info!("Download task completed");
-
-                match download_result {
-                    UpdateProcessResult::ApplicationUpdated => {
-                        info!("Application updated");
-                        app_message_sender.send(Message::Launch);
-                    }
-                    UpdateProcessResult::UpdaterUpdated => {
-                        // The updater itself was updated, we should exit because a new
-                        // process was started with the new updater to update the
-                        // application.
-                        info!("Updater updated");
-                        app_message_sender.send(Message::Shutdown);
-                        app::awake();
-                    }
-                }
-            } else {
-                let err = result.err().unwrap();
-                let message = err.to_string();
-                let details = format!("{:#}", err);
-                error!("Download task failed or cancelled: {}", &details);
-                app_message_sender.send(Message::Error { message, details });
+                    Ok(())
+                },
+            )
+            .await;
+            if let Some(Err(error)) = result {
+                error!("Update failed: {error:#}");
+                app_message_sender.send(Message::Error {
+                    message: error.to_string(),
+                    details: format!("{error:#}"),
+                });
             }
         })
     };
+    operation_tasks.borrow_mut().push(startup_task);
 
-    while app.wait() {
-        if let Some(e) = app_message_receiver.recv() {
+    let mut runtime_ready = false;
+    'event_loop: while app.wait() {
+        // RuntimeStarted and OperationComplete can arrive in the same wakeup
+        // when no installation is needed. Drain both before waiting again.
+        while let Some(e) = app_message_receiver.recv() {
             match e {
-                Message::Launch => {
-                    info!("Ready to launch");
-                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
-                }
                 Message::Shutdown => {
                     info!("Shutting down");
-                    break;
+                    break 'event_loop;
                 }
                 Message::Error { message, details } => {
                     rfd::MessageDialog::new()
@@ -1781,41 +1823,80 @@ async fn main() -> process::ExitCode {
                             details
                         ))
                         .show();
-                    break;
+                    break 'event_loop;
                 }
                 Message::VerifyStarted => {
                     launch_button.deactivate();
                     launch_button.redraw();
                 }
-                Message::VerifyComplete {
-                    repaired,
-                    runtime_note,
-                } => {
-                    info!(repaired, "Verification complete");
-                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
-
-                    let mut message = if repaired == 0 {
-                        "All files verified successfully".to_string()
-                    } else {
-                        format!("Repaired {} file(s)", repaired)
+                Message::RuntimeStarted => {
+                    verify_button.deactivate();
+                    verify_button.set_label("Please wait");
+                    verify_button.redraw();
+                }
+                Message::OperationComplete { repaired, runtime } => {
+                    runtime_ready = runtime
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.ready_to_play());
+                    restore_ready_state(
+                        &mut launch_button,
+                        &mut verify_button,
+                        &progress_state,
+                        runtime_ready,
+                    );
+                    let mut message = repaired.map(|count| {
+                        if count == 0 {
+                            "All files verified successfully".to_string()
+                        } else {
+                            format!("Repaired {} file(s)", count)
+                        }
+                    });
+                    let failed = runtime.is_err();
+                    let note = match runtime {
+                        Ok(outcome) => outcome.note().map(str::to_owned),
+                        Err(error) => Some(error),
                     };
-                    if let Some(note) = runtime_note {
-                        message = format!("{}\n\n{}", message, note);
+                    if let Some(note) = note {
+                        message = Some(match message {
+                            Some(message) => format!("{message}\n\n{note}"),
+                            None => note,
+                        });
                     }
-
-                    rfd::MessageDialog::new()
-                        .set_level(rfd::MessageLevel::Info)
-                        .set_title("Verification Complete")
-                        .set_description(&message)
-                        .show();
+                    if let Some(message) = message {
+                        rfd::MessageDialog::new()
+                            .set_level(if failed {
+                                rfd::MessageLevel::Error
+                            } else {
+                                rfd::MessageLevel::Info
+                            })
+                            .set_title(if failed {
+                                "Runtime Installation Failed"
+                            } else if repaired.is_some() {
+                                "Verification Complete"
+                            } else {
+                                "Runtime Installation Complete"
+                            })
+                            .set_description(&message)
+                            .show();
+                    }
                 }
                 Message::VerifyCancelled => {
                     info!("Verification cancelled");
-                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
+                    restore_ready_state(
+                        &mut launch_button,
+                        &mut verify_button,
+                        &progress_state,
+                        runtime_ready,
+                    );
                 }
                 Message::VerifyFailed(e) => {
                     error!("Manual verification failed: {}", e);
-                    restore_ready_state(&mut launch_button, &mut verify_button, &progress_state);
+                    restore_ready_state(
+                        &mut launch_button,
+                        &mut verify_button,
+                        &progress_state,
+                        runtime_ready,
+                    );
                     rfd::MessageDialog::new()
                         .set_level(rfd::MessageLevel::Error)
                         .set_title("Verification Error")
@@ -1857,6 +1938,14 @@ async fn main() -> process::ExitCode {
 
     info!("Sending shutdown signal");
     let _ = shutdown_tx.send(true);
+    // Do not drop a runtime-installation future at Tokio shutdown. File work
+    // observes shutdown above; an installer already started is awaited normally.
+    let tasks = std::mem::take(&mut *operation_tasks.borrow_mut());
+    for task in tasks {
+        if let Err(error) = task.await {
+            error!("Updater task failed: {error}");
+        }
+    }
     info!("Terminating application");
     process::ExitCode::SUCCESS
 }
@@ -2009,5 +2098,99 @@ mod tests {
         assert!(should_remove_text_file(RemoteFilePass::update(), xml_path));
         assert!(!should_remove_text_file(RemoteFilePass::verify(), xml_path));
         assert!(!should_remove_text_file(RemoteFilePass::update(), bin_path));
+    }
+}
+
+#[cfg(test)]
+mod runtime_flow_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_before_files_finish_does_not_start_runtime() {
+        let result: Option<anyhow::Result<()>> = run_cancellable_files(
+            std::future::pending::<anyhow::Result<()>>(),
+            std::future::ready(()),
+            |_| async { panic!("runtime must not start after cancellation") },
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_runtime_preserves_its_completion_result() {
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_cancellable_files(async { Ok(()) }, cancelled.changed(), |_| async {
+                started.send(()).unwrap();
+                finish_rx.await.unwrap();
+                Ok(vc_runtime::Outcome::RestartRequired)
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        let _ = cancel.send(true);
+        assert!(!task.is_finished(), "must still await the installer");
+        finish.send(()).unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap().unwrap(),
+            vc_runtime::Outcome::RestartRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_file_verification_does_not_start_runtime() {
+        let result: Option<anyhow::Result<()>> = run_cancellable_files(
+            std::future::ready(Err::<(), _>(anyhow::anyhow!("file verification failed"))),
+            std::future::pending::<()>(),
+            |_| async { panic!("runtime must not run after file failure") },
+        )
+        .await;
+        assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn install_no_change_update_and_verify_read_fresh_manifest_requirements() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            for version in ["14.44", "14.50", "14.51.123"] {
+                let (mut socket, _) = server.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                let manifest = RemoteManifest {
+                    version: 1,
+                    vc_runtime_min_version: Some(version.parse().unwrap()),
+                    ..Default::default()
+                };
+                let body = serde_json::to_string(&manifest).unwrap();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Args::try_parse_from([
+            "updater",
+            "--skip-updater",
+            "--url",
+            &format!("http://{address}/"),
+            "--output",
+            directory.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        for (verify, version) in [(false, "14.44"), (false, "14.50"), (true, "14.51.123")] {
+            args.verify = verify;
+            let result = run_file_process(&args, ProgressState::default())
+                .await
+                .unwrap();
+            let UpdateProcessResult::ApplicationUpdated(files) = result else {
+                panic!("unexpected self-update");
+            };
+            assert_eq!(files.vc_runtime_min_version, Some(version.parse().unwrap()));
+            assert_eq!(files.repaired, if verify { Some(0) } else { None });
+        }
+        serving.await.unwrap();
     }
 }

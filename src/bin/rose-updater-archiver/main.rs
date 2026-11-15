@@ -8,7 +8,7 @@ use tokio::fs;
 use tokio::fs::File;
 use walkdir::WalkDir;
 
-use rose_update::manifest::{RemoteManifest, RemoteManifestFileEntry};
+use rose_update::manifest::{RemoteManifest, RemoteManifestFileEntry, RuntimeVersion};
 use rose_update::CHUNK_SIZE_BYTES;
 
 const REMOTE_MANIFEST_VERSION: usize = 1;
@@ -52,6 +52,12 @@ struct Args {
     #[clap(long, default_value = "manifest.json")]
     manifest_name: String,
 
+    /// Minimum Windows x64 Visual C++ runtime (e.g. 14.44 or 14.44.35211).
+    /// Publish this only in a Windows client manifest. Defaults to 14.44 on Windows.
+    #[clap(long)]
+    #[cfg_attr(windows, clap(default_value = "14.44"))]
+    vc_runtime_min_version: Option<RuntimeVersion>,
+
     /// Compression level to use (0 to 22)
     #[clap(long, default_value="4", value_parser=parse_compression_level)]
     compression_level: u32,
@@ -79,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut manifest = RemoteManifest {
         version: REMOTE_MANIFEST_VERSION,
+        vc_runtime_min_version: args.vc_runtime_min_version,
         ..Default::default()
     };
 
@@ -153,4 +160,46 @@ async fn main() -> anyhow::Result<()> {
     serde_json::to_writer(manifest_file, &manifest)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_requirement_can_be_changed_without_rebuilding() {
+        let args = Args::try_parse_from([
+            "archiver",
+            "input",
+            "output",
+            "--vc-runtime-min-version",
+            "14.50.12345.6",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.vc_runtime_min_version,
+            Some(RuntimeVersion([14, 50, 12345, 6]))
+        );
+        assert!(Args::try_parse_from([
+            "archiver",
+            "input",
+            "output",
+            "--vc-runtime-min-version",
+            "latest"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn runtime_default_is_only_published_on_windows() {
+        let args = Args::try_parse_from(["archiver", "input", "output"]).unwrap();
+        assert_eq!(
+            args.vc_runtime_min_version,
+            if cfg!(windows) {
+                Some(RuntimeVersion([14, 44, 0, 0]))
+            } else {
+                None
+            }
+        );
+    }
 }

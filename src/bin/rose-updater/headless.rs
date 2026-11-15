@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use rose_update::progress::{ProgressStage, ProgressState};
 
-use crate::{run_verify_process, update_process, Args, UpdateProcessResult};
+use crate::{run_file_process, vc_runtime, Args, UpdateProcessResult};
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
@@ -23,6 +23,8 @@ enum Event {
     Done {
         #[serde(skip_serializing_if = "Option::is_none")]
         repaired: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime_note: Option<&'static str>,
     },
     UpdaterUpdated,
     Error {
@@ -44,6 +46,7 @@ fn stage_str(stage: ProgressStage) -> &'static str {
         ProgressStage::DownloadingUpdates => "downloading-updates",
         ProgressStage::VerifyingFiles => "verifying-files",
         ProgressStage::Play => "play",
+        ProgressStage::InstallingRuntime => "installing-runtime",
     }
 }
 
@@ -134,20 +137,28 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
         })
     };
 
-    let result = if args.verify {
-        run_verify_process(
-            &args.url,
-            &args.manifest_name,
-            &args.output,
-            progress_state.clone(),
-        )
-        .await
-        .map(Outcome::Verified)
-    } else {
-        update_process(&args, progress_state.clone())
-            .await
-            .map(Outcome::Update)
-    };
+    let result = async {
+        match run_file_process(&args, progress_state.clone()).await? {
+            UpdateProcessResult::ApplicationUpdated(files) => {
+                let runtime = vc_runtime::ensure_installed(
+                    files.vc_runtime_min_version,
+                    progress_state.clone(),
+                )
+                .await?;
+                // Existing consumers treat `done` as safe to launch. Keep that
+                // contract when installation needs a reboot.
+                if !runtime.ready_to_play() {
+                    anyhow::bail!(runtime.note().unwrap());
+                }
+                Ok(Outcome::Complete {
+                    repaired: files.repaired,
+                    runtime,
+                })
+            }
+            UpdateProcessResult::UpdaterUpdated => Ok(Outcome::UpdaterUpdated),
+        }
+    }
+    .await;
 
     // abort() does not preempt a task that is already running: it cancels at the
     // next await point, and emit() is synchronous. Await the handle so the emitter
@@ -163,17 +174,14 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
     });
 
     match result {
-        Ok(Outcome::Update(UpdateProcessResult::ApplicationUpdated)) => {
-            emit(&Event::Done { repaired: None });
-            ExitCode::SUCCESS
-        }
-        Ok(Outcome::Verified(repaired)) => {
+        Ok(Outcome::Complete { repaired, runtime }) => {
             emit(&Event::Done {
-                repaired: Some(repaired),
+                repaired,
+                runtime_note: runtime.note(),
             });
             ExitCode::SUCCESS
         }
-        Ok(Outcome::Update(UpdateProcessResult::UpdaterUpdated)) => {
+        Ok(Outcome::UpdaterUpdated) => {
             emit(&Event::UpdaterUpdated);
             // Caller respawns us; a detached self-respawn would orphan its pipe.
             ExitCode::from(10)
@@ -186,8 +194,11 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
 }
 
 enum Outcome {
-    Update(UpdateProcessResult),
-    Verified(usize),
+    Complete {
+        repaired: Option<usize>,
+        runtime: vc_runtime::Outcome,
+    },
+    UpdaterUpdated,
 }
 
 #[cfg(test)]
@@ -207,11 +218,19 @@ mod tests {
             r#"{"event":"progress","stage":"checking-files","current":3,"max":10}"#
         );
         assert_eq!(
-            serde_json::to_string(&Event::Done { repaired: None }).unwrap(),
+            serde_json::to_string(&Event::Done {
+                repaired: None,
+                runtime_note: None
+            })
+            .unwrap(),
             r#"{"event":"done"}"#
         );
         assert_eq!(
-            serde_json::to_string(&Event::Done { repaired: Some(2) }).unwrap(),
+            serde_json::to_string(&Event::Done {
+                repaired: Some(2),
+                runtime_note: None
+            })
+            .unwrap(),
             r#"{"event":"done","repaired":2}"#
         );
         assert_eq!(
@@ -235,6 +254,25 @@ mod tests {
             })
             .unwrap(),
             r#"{"event":"error","code":null,"message":"boom","details":"chain"}"#
+        );
+    }
+
+    #[test]
+    fn successful_runtime_installation_is_reported_in_done() {
+        let event = Event::Done {
+            repaired: Some(0),
+            runtime_note: vc_runtime::Outcome::Installed.note(),
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "event": "done", "repaired": 0,
+                "runtime_note": "Installed the Microsoft Visual C++ Redistributable."
+            })
+        );
+        assert_eq!(
+            stage_str(ProgressStage::InstallingRuntime),
+            "installing-runtime"
         );
     }
 

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fmt, path::Path, str::FromStr};
 
 use anyhow::Context;
 use reqwest::Url;
@@ -13,6 +13,62 @@ pub struct RemoteManifest {
     pub version: usize,
     pub updater: RemoteManifestFileEntry,
     pub files: Vec<RemoteManifestFileEntry>,
+    /// Windows x64 prerequisite. Omitted by legacy and non-Windows manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vc_runtime_min_version: Option<RuntimeVersion>,
+}
+
+/// A Windows file version, compared numerically (missing build/revision = zero).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(try_from = "String", into = "String")]
+pub struct RuntimeVersion(pub [u16; 4]);
+
+impl FromStr for RuntimeVersion {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<_> = value.split('.').collect();
+        let invalid =
+            || "Runtime version must have 2 to 4 numeric components (e.g. 14.44)".to_string();
+        if !(2..=4).contains(&parts.len()) {
+            return Err(invalid());
+        }
+        let mut version = [0; 4];
+        for (index, part) in parts.iter().enumerate() {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            version[index] = part.parse().map_err(|_| invalid())?;
+        }
+        Ok(Self(version))
+    }
+}
+
+impl TryFrom<String> for RuntimeVersion {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for RuntimeVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.0[0], self.0[1])?;
+        if self.0[2] != 0 || self.0[3] != 0 {
+            write!(f, ".{}", self.0[2])?;
+        }
+        if self.0[3] != 0 {
+            write!(f, ".{}", self.0[3])?;
+        }
+        Ok(())
+    }
+}
+
+impl From<RuntimeVersion> for String {
+    fn from(value: RuntimeVersion) -> Self {
+        value.to_string()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -110,4 +166,57 @@ pub async fn download_remote_manifest(
         .context(ErrorCode::InvalidServerData.to_string())?;
 
     Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_manifest_has_no_runtime_requirement() {
+        let mut json = serde_json::to_value(RemoteManifest::default()).unwrap();
+        assert!(json.get("vc_runtime_min_version").is_none());
+        let legacy: RemoteManifest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(legacy.vc_runtime_min_version, None);
+
+        json["vc_runtime_min_version"] = "14.50.12345.6".into();
+        let manifest: RemoteManifest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            manifest.vc_runtime_min_version,
+            Some(RuntimeVersion([14, 50, 12345, 6]))
+        );
+        assert_eq!(
+            serde_json::to_value(manifest).unwrap()["vc_runtime_min_version"],
+            "14.50.12345.6"
+        );
+    }
+
+    #[test]
+    fn runtime_versions_compare_numeric_components() {
+        let version = |v: &str| v.parse::<RuntimeVersion>().unwrap();
+        assert!(version("14.9") < version("14.44"));
+        assert!(version("14.44.123") < version("14.44.123.1"));
+        assert_eq!(version("14.44"), version("14.44.0.0"));
+        assert!(version("15.0") > version("14.99.65535.65535"));
+    }
+
+    #[test]
+    fn malformed_requirements_fail_instead_of_disabling_the_check() {
+        for value in [
+            "",
+            "14",
+            "14.",
+            "14.44.0.0.1",
+            "14.-1",
+            "14.+44",
+            "14.65536",
+            "14.44 ",
+            "latest",
+        ] {
+            assert!(
+                serde_json::from_value::<RuntimeVersion>(value.into()).is_err(),
+                "{value}"
+            );
+        }
+    }
 }

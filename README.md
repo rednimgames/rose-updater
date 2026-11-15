@@ -42,6 +42,52 @@ For more information check use the `--help` commands the executables
 
 ## Features
 
+### Windows Visual C++ runtime
+
+The Windows remote `manifest.json` can declare a minimum x64 runtime:
+
+```json
+"vc_runtime_min_version": "14.44"
+```
+
+This is a top-level field alongside `version`, `updater`, and `files`. Versions
+have two to four numeric components (`14.44`, `14.44.35211`, or
+`14.44.35211.0`); missing build/revision components are treated as zero.
+
+The updater reads the requirement from the server on every install, normal
+update (even when no game files changed), Repair, and `--verify`, including
+`--headless --verify`. Windows checks the system `msvcp140.dll` after the file
+operation succeeds. If it is missing or too old, the updater downloads the
+latest Microsoft v14 x64 redistributable and requests elevation to install it.
+It does not download or elevate when the runtime already meets the requirement.
+macOS and Linux ignore this field. Older manifests without the field skip this
+step, and older updaters ignore the additional field.
+
+The Windows archiver emits `14.44` by default. Set the requirement when producing
+a Windows release (also supported when archiving on another platform):
+
+```sh
+rose-updater-archiver input output --vc-runtime-min-version 14.50
+```
+
+To raise the requirement later, change that build argument or the field in the
+published Windows manifest. No new updater build or game-file hash change is
+needed. Keep the requirement in sync with the client's build toolset; the
+download endpoint supplies the latest **v14** runtime, not older VC++ families.
+The initial rollout needs this updater release and a manifest containing the
+field. The Windows setup installer's bundled redistributable is independent.
+
+Stop cancels file verification only. Once the runtime phase begins, Repair stays
+disabled until the installer exits; closing the window also waits for completion.
+Installation failures and restart-required results keep Play disabled. Exit code
+1638 is accepted only if a fresh DLL check meets the manifest requirement.
+
+Headless progress adds the `installing-runtime` stage. Successful installation
+adds an optional `runtime_note` to the existing `done` event; unchanged runtimes
+preserve the existing event shape. A runtime failure or required restart emits
+`error` and exits with code 1 instead of emitting `done`, so callers do not launch
+the game before its prerequisite is ready.
+
 ### Force rechecks
 
 It's possible the cache might get out of sync or we might want to force our
