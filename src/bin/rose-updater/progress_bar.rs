@@ -31,6 +31,9 @@ fn progress_message(stage: ProgressStage, value: usize, max: usize) -> String {
             )
         }
         ProgressStage::VerifyingFiles => "Verifying / repairing files".into(),
+        ProgressStage::InstallingRuntime => {
+            "Installing Microsoft Visual C++ Redistributable".into()
+        }
         _ => "".into(),
     }
 }
