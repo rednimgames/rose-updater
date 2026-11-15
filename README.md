@@ -88,6 +88,24 @@ preserve the existing event shape. A runtime failure or required restart emits
 `error` and exits with code 1 instead of emitting `done`, so callers do not launch
 the game before its prerequisite is ready.
 
+### Native launcher
+
+The launcher uses FLTK and targets Windows, macOS, and Linux, including Steam Deck.
+Its news cards load directly from the ROSE website's JSON API. No WebView2,
+WebKitGTK, embedded browser, or JavaScript runtime is required. News and image
+requests run independently of game updates; a news outage does not prevent
+updating or launching the game. Article and social links open in the default
+browser.
+
+The original launcher artwork, font metrics, two-large/three-small news grid,
+and update controls are retained. Artwork and font sources are recorded in
+`res/NEWS-ASSETS.txt`. Fonts are bundled and loaded privately from the app cache.
+
+Linux builds still require FLTK's X11/Pango/Cairo libraries (see the packages in
+`.github/workflows/ci.yaml`). Test release binaries on the intended Linux/SteamOS
+runtime, including Steam Deck Desktop and Gaming modes; a CI build alone does
+not validate window management, touch input, or game launch handoff.
+
 ### Force rechecks
 
 It's possible the cache might get out of sync or we might want to force our
