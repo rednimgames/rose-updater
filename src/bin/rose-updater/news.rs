@@ -13,6 +13,7 @@ use fltk::{
 use futures::{stream, StreamExt};
 use image::{imageops::FilterType, ImageReader};
 use reqwest::{Client, Url};
+use rose_update::error::ErrorCode;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -49,7 +50,7 @@ struct Category {
 pub(super) enum NewsMessage {
     Articles(Vec<Article>),
     Image { index: usize, pixels: Vec<u8> },
-    Failed,
+    Failed(ErrorCode),
 }
 
 #[derive(Clone, Copy)]
@@ -153,7 +154,7 @@ fn web_url(value: &str) -> Option<Url> {
 }
 
 fn parse_articles(bytes: &[u8]) -> anyhow::Result<Vec<Article>> {
-    let mut feed: Feed = serde_json::from_slice(bytes)?;
+    let mut feed: Feed = serde_json::from_slice(bytes).context(ErrorCode::InvalidServerData)?;
     feed.data.truncate(CARD_COUNT);
     Ok(feed.data)
 }
@@ -264,14 +265,24 @@ fn load_fonts() -> anyhow::Result<()> {
 pub(super) async fn load(sender: app::Sender<Message>) {
     if let Err(error) = load_feed(sender).await {
         // News is optional; never send a fatal updater error for a website failure.
-        warn!(%error, "Unable to load launcher news");
-        sender.send(Message::News(NewsMessage::Failed));
+        let code = error
+            .downcast_ref::<ErrorCode>()
+            .copied()
+            .unwrap_or(ErrorCode::FetchNews);
+        warn!(error = %format!("{error:#}"), "Unable to load launcher news");
+        sender.send(Message::News(NewsMessage::Failed(code)));
     }
 }
 
 async fn load_feed(sender: app::Sender<Message>) -> anyhow::Result<()> {
-    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let bytes = fetch_bytes(&client, Url::parse(NEWS_URL)?, MAX_NEWS_BYTES).await?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context(ErrorCode::SetupConnection)?;
+    let url = Url::parse(NEWS_URL).context(ErrorCode::InvalidServerAddress)?;
+    let bytes = fetch_bytes(&client, url, MAX_NEWS_BYTES)
+        .await
+        .context(ErrorCode::FetchNews)?;
     let articles = parse_articles(&bytes)?;
     let images: Vec<_> = articles
         .iter()
@@ -596,8 +607,11 @@ impl NewsPanel {
                     }
                 }
             }
-            NewsMessage::Failed => {
-                self.status.set_label("Failed to fetch the latest news.");
+            NewsMessage::Failed(code) => {
+                self.status.set_label(&format!(
+                    "Failed to fetch the latest news.\nError: ROSE-{}",
+                    code.code()
+                ));
                 self.status.show();
             }
         }
@@ -661,7 +675,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["0", "1", "2", "3", "4"]
         );
-        assert!(parse_articles(b"<html>Maintenance</html>").is_err());
+        let error = parse_articles(b"<html>Maintenance</html>").unwrap_err();
+        assert_eq!(error.downcast_ref::<ErrorCode>().unwrap().code(), 300);
         assert!(parse_articles(br#"{"data":[]}"#).unwrap().is_empty());
     }
 
