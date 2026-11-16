@@ -547,11 +547,14 @@ mod spawn_tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = scratch_dir("relative-exe");
-        let exe = dir.join(default_exe());
+        // A distinct basename keeps this launch-path fixture from appearing as
+        // a real game client to concurrently running update tests.
+        let exe_name = Path::new("rose-spawn-test");
+        let exe = dir.join(exe_name);
         std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let result = spawn_process_std(Path::new(default_exe()), &[], Some(&dir));
+        let result = spawn_process_std(exe_name, &[], Some(&dir));
 
         let _ = std::fs::remove_dir_all(&dir);
         result.unwrap();
@@ -1230,8 +1233,7 @@ async fn update_process(
         progress_state.clone(),
         RemoteFilePass::update(),
     )
-    .await
-    .context(ErrorCode::CheckForUpdates.to_string())?;
+    .await?;
 
     // Set execute permission on the game executable for Unix platforms
     #[cfg(unix)]
@@ -1260,8 +1262,7 @@ async fn update_process(
             progress_state,
             RemoteFilePass::verify(),
         )
-        .await
-        .context(ErrorCode::CheckForUpdates.to_string())?
+        .await?
     };
 
     if files_repaired > 0 {
@@ -2153,6 +2154,36 @@ mod runtime_flow_tests {
         // A retry takes a fresh snapshot and is allowed after the client exits.
         client.stop();
         game_process::ensure_stopped(&args.exe).unwrap();
+
+        // A client can also start while the manifest is downloading. The
+        // later guard must keep its actionable process error (not ROSE-100)
+        // and leave the saved manifest and files untouched.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        args.url = format!("http://{}/", server.local_addr().unwrap());
+        args.verify = false;
+        args.skip_updater = true;
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            let client = game_process::tests::Client::start();
+            let body = serde_json::to_string(&RemoteManifest::default()).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            client
+        });
+        let error = run_file_process(&args, ProgressState::default())
+            .await
+            .unwrap_err();
+        let _client = serving.await.unwrap();
+        assert!(error.to_string().contains("[ROSE-405]"), "{error:#}");
+        assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
+        assert_eq!(std::fs::read(&game_file).unwrap(), b"installed game data");
     }
 
     #[tokio::test]

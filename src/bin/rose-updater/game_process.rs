@@ -84,13 +84,18 @@ fn process_names() -> anyhow::Result<Vec<String>> {
         {
             continue;
         }
-        match std::fs::read_to_string(entry.path().join("comm")) {
-            Ok(name) => names.push(name.trim_end_matches('\n').to_owned()),
+        let status = match std::fs::read_to_string(entry.path().join("status")) {
+            Ok(status) => status,
             // Processes can exit while we enumerate them.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
+        };
+        if let Some(name) = linux_process_name(&status) {
+            names.push(name.to_owned());
+        } else {
+            continue;
         }
-        // comm is limited to 15 bytes. Also check the executable for longer
+        // Name is limited to 15 bytes. Also check the executable for longer
         // custom --exe names; kernel threads/other users may not expose it.
         if let Ok(exe) = std::fs::read_link(entry.path().join("exe")) {
             names.push(
@@ -101,6 +106,19 @@ fn process_names() -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_name(status: &str) -> Option<&str> {
+    let state = status
+        .lines()
+        .find_map(|line| line.strip_prefix("State:"))?;
+    // Zombies/dead processes no longer hold game files, even if their parent
+    // has not reaped them. They must not block updates indefinitely.
+    if matches!(state.split_whitespace().next(), Some("Z" | "X")) {
+        return None;
+    }
+    status.lines().find_map(|line| line.strip_prefix("Name:\t"))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -122,6 +140,24 @@ fn process_names() -> anyhow::Result<Vec<String>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_linux_processes_do_not_block_updates() {
+        assert_eq!(
+            linux_process_name("Name:\ttrose\nState:\tS (sleeping)\n"),
+            Some("trose")
+        );
+        assert_eq!(
+            linux_process_name("Name:\ttrose\nState:\tR (running)\n"),
+            Some("trose")
+        );
+        assert_eq!(
+            linux_process_name("Name:\ttrose\nState:\tZ (zombie)\n"),
+            None
+        );
+        assert_eq!(linux_process_name("Name:\ttrose\nState:\tX (dead)\n"), None);
+    }
 
     #[test]
     fn matches_game_names_and_configured_executable_only() {
