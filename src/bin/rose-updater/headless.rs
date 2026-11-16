@@ -138,7 +138,7 @@ pub(crate) async fn run_headless(args: Args) -> ExitCode {
     };
 
     let result = async {
-        match run_file_process(&args, progress_state.clone()).await? {
+        match run_file_process(&args, progress_state.clone(), None).await? {
             UpdateProcessResult::ApplicationUpdated(files) => {
                 let runtime = vc_runtime::ensure_installed(
                     files.vc_runtime_min_version,

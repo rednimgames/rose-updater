@@ -258,6 +258,25 @@ The launcher tried to start the game but could not find or run the game executab
 3. Try running the launcher as administrator
 4. If `trose.exe` is missing, close and reopen the launcher to re-download it
 
+### ROSE-405 — ROSE Online is running
+
+The launcher stopped the update or Repair because a game client is running.
+
+**What to try:**
+1. Close all ROSE Online clients, including clients from other installation folders
+2. Restart the launcher, or click Repair again if a manual repair was blocked
+3. If the game window has closed but this error persists, check Task Manager for a remaining `trose.exe` process
+
+### ROSE-406 — Could not check whether ROSE Online is running
+
+The headless updater could not inspect running processes, so it stopped before
+updating. The graphical launcher instead offers an OK/Cancel confirmation.
+
+**What to try:**
+1. Close all ROSE Online clients
+2. Open the graphical launcher and press OK when asked to confirm the client is stopped
+3. Press Cancel if you are unsure; the update will stop and you can try again later
+
 ---
 
 ## Initialization Errors (ROSE-5xx)
