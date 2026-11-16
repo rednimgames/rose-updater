@@ -42,6 +42,20 @@ For more information check use the `--help` commands the executables
 
 ## Features
 
+### Updating while the game is running
+
+Close all ROSE Online clients before starting an update or Repair. The launcher
+checks for `trose`, `trose.exe`, and the configured `--exe` name before file work,
+including self-updates, forced rechecks, and `--verify`. It checks again before
+modifying game files after downloading metadata or scanning local files. Matching
+is case-insensitive and applies to clients in any installation directory.
+
+A running client stops the operation with `ROSE-405`; failure to inspect running
+processes stops it with `ROSE-406`. Headless mode emits an `error` event and exits
+with code 1, without emitting `done`. Close the game and restart the launcher,
+or retry Repair. Failed or cancelled repairs keep Play disabled until a subsequent
+repair and runtime check succeed.
+
 ### DNS fallback
 
 Manifest, archive, launcher news/image, and Visual C++ runtime downloads use

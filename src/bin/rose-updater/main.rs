@@ -39,6 +39,7 @@ use rose_update::manifest::{
     LocalManifestFileEntry, RemoteManifest, RuntimeVersion,
 };
 
+mod game_process;
 pub mod headless;
 pub mod launch_button;
 mod news;
@@ -810,11 +811,20 @@ async fn run_verify_process(
     verify_url: &str,
     manifest_name: &str,
     output_dir: &Path,
+    executable: &Path,
     progress_state: ProgressState,
 ) -> anyhow::Result<FileProcessResult> {
+    game_process::ensure_stopped(executable)?;
     let remote_url = parse_remote_url(verify_url)?;
 
-    verify_and_repair(&remote_url, manifest_name, output_dir, progress_state).await
+    verify_and_repair(
+        &remote_url,
+        manifest_name,
+        output_dir,
+        executable,
+        progress_state,
+    )
+    .await
 }
 
 /// Check which files need to be updated by comparing our local manifest to the remote manifest
@@ -857,6 +867,7 @@ async fn get_remote_files(
     base_url: &Url,
     files_to_update: &[FileToDownload],
     output_dir: &Path,
+    executable: &Path,
     progress_state: ProgressState,
     pass: RemoteFilePass,
 ) -> anyhow::Result<usize> {
@@ -886,6 +897,9 @@ async fn get_remote_files(
         .iter()
         .map(|file_data| output_dir.join(&file_data.local_path))
         .collect();
+
+    // Metadata requests may take time. Recheck before deleting any text files.
+    game_process::ensure_stopped(executable)?;
 
     // Bitar doesn't handle text files well so when one of the text files
     // has changed, we delete it first so bitar will just redownload the
@@ -942,6 +956,9 @@ async fn get_remote_files(
         "Initializing clone outputs"
     );
 
+    // Scanning large installations can also take time. Refuse to open/reorder
+    // files if a client was started since the initial check.
+    game_process::ensure_stopped(executable)?;
     let mut clone_outputs = {
         let clone_output_tasks = archive_readers
             .iter()
@@ -1058,6 +1075,7 @@ async fn verify_and_repair(
     remote_url: &Url,
     manifest_name: &str,
     output_dir: &Path,
+    executable: &Path,
     progress_state: ProgressState,
 ) -> anyhow::Result<FileProcessResult> {
     progress_state.set_stage(ProgressStage::FetchingMetadata);
@@ -1073,6 +1091,7 @@ async fn verify_and_repair(
         remote_url,
         &all_files,
         output_dir,
+        executable,
         progress_state,
         RemoteFilePass::verify(),
     )
@@ -1096,6 +1115,7 @@ async fn update_process(
     args: &Args,
     progress_state: ProgressState,
 ) -> anyhow::Result<UpdateProcessResult> {
+    game_process::ensure_stopped(&args.exe)?;
     progress_state.set_stage(ProgressStage::FetchingMetadata);
 
     fs::create_dir_all(&args.output)
@@ -1129,6 +1149,7 @@ async fn update_process(
     let local_manifest = if !args.skip_updater
         && (args.force_recheck_updater || updater_needs_update)
     {
+        game_process::ensure_stopped(&args.exe)?;
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
         let remote = remote_url
@@ -1205,6 +1226,7 @@ async fn update_process(
         &remote_url,
         &files_to_update,
         &args.output,
+        &args.exe,
         progress_state.clone(),
         RemoteFilePass::update(),
     )
@@ -1234,6 +1256,7 @@ async fn update_process(
             &remote_url,
             &files_to_update,
             &args.output,
+            &args.exe,
             progress_state,
             RemoteFilePass::verify(),
         )
@@ -1263,9 +1286,15 @@ async fn run_file_process(
     progress: ProgressState,
 ) -> anyhow::Result<UpdateProcessResult> {
     if args.verify {
-        run_verify_process(&args.url, &args.manifest_name, &args.output, progress)
-            .await
-            .map(UpdateProcessResult::ApplicationUpdated)
+        run_verify_process(
+            &args.url,
+            &args.manifest_name,
+            &args.output,
+            &args.exe,
+            progress,
+        )
+        .await
+        .map(UpdateProcessResult::ApplicationUpdated)
     } else {
         update_process(args, progress).await
     }
@@ -1343,7 +1372,11 @@ fn restore_ready_state(
     } else {
         launch_button.deactivate();
     }
-    launch_button.change_state(launch_button::LaunchButtonState::Play);
+    launch_button.change_state(if runtime_ready {
+        launch_button::LaunchButtonState::Play
+    } else {
+        launch_button::LaunchButtonState::Update
+    });
     launch_button.redraw();
 
     verify_button.set_label("Repair");
@@ -1600,6 +1633,7 @@ async fn main() -> process::ExitCode {
     let verify_url = args.url.clone();
     let verify_manifest_name = args.manifest_name.clone();
     let verify_output = args.output.clone();
+    let verify_exe = args.exe.clone();
 
     // When the launch button is clicked we start the application
     launch_button.set_callback(move |_| {
@@ -1640,6 +1674,7 @@ async fn main() -> process::ExitCode {
         let verify_url = verify_url.clone();
         let verify_manifest_name = verify_manifest_name.clone();
         let verify_output = verify_output.clone();
+        let verify_exe = verify_exe.clone();
         let operation_tasks = operation_tasks.clone();
         let shutdown_rx = shutdown_rx.clone();
 
@@ -1669,6 +1704,7 @@ async fn main() -> process::ExitCode {
             let verify_url = verify_url.clone();
             let verify_manifest_name = verify_manifest_name.clone();
             let verify_output = verify_output.clone();
+            let verify_exe = verify_exe.clone();
 
             let (cancel_send, mut cancel_recv) = tokio::sync::watch::channel(false);
             let cancel_tx_clone = cancel_tx.clone();
@@ -1684,6 +1720,7 @@ async fn main() -> process::ExitCode {
                         &verify_url,
                         &verify_manifest_name,
                         &verify_output,
+                        &verify_exe,
                         progress_state.clone(),
                     ),
                     async {
@@ -1753,7 +1790,6 @@ async fn main() -> process::ExitCode {
     };
     operation_tasks.borrow_mut().push(startup_task);
 
-    let mut runtime_ready = false;
     'event_loop: while app.wait() {
         // News images and runtime/update completions can share one FLTK wake-up.
         while let Some(e) = app_message_receiver.recv() {
@@ -1771,7 +1807,7 @@ async fn main() -> process::ExitCode {
                         .set_level(rfd::MessageLevel::Error)
                         .set_title("Update Error")
                         .set_description(format!(
-                            "{}\n\nIf this keeps happening, check your internet connection or try again later.\n\nDetails: {}",
+                            "{}\n\nDetails: {}",
                             message,
                             details
                         ))
@@ -1788,7 +1824,7 @@ async fn main() -> process::ExitCode {
                     verify_button.redraw();
                 }
                 Message::OperationComplete { repaired, runtime } => {
-                    runtime_ready = runtime
+                    let runtime_ready = runtime
                         .as_ref()
                         .is_ok_and(|outcome| outcome.ready_to_play());
                     restore_ready_state(
@@ -1835,11 +1871,13 @@ async fn main() -> process::ExitCode {
                 }
                 Message::VerifyCancelled => {
                     info!("Verification cancelled");
+                    // Repair may already have modified files. Only a successful
+                    // file pass and runtime check can make Play available again.
                     restore_ready_state(
                         &mut launch_button,
                         &mut verify_button,
                         &progress_state,
-                        runtime_ready,
+                        false,
                     );
                 }
                 Message::VerifyFailed(e) => {
@@ -1848,7 +1886,7 @@ async fn main() -> process::ExitCode {
                         &mut launch_button,
                         &mut verify_button,
                         &progress_state,
-                        runtime_ready,
+                        false,
                     );
                     rfd::MessageDialog::new()
                         .set_level(rfd::MessageLevel::Error)
@@ -2059,6 +2097,63 @@ mod tests {
 #[cfg(test)]
 mod runtime_flow_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn running_game_blocks_update_and_repair_without_changing_files_or_manifest() {
+        let mut client = game_process::tests::Client::start();
+        let directory = tempfile::tempdir().unwrap();
+        let mut args = Args::try_parse_from([
+            "updater",
+            "--headless",
+            "--skip-updater=false",
+            "--url",
+            "http://127.0.0.1:1/",
+            "--output",
+            directory.path().to_str().unwrap(),
+            "--exe",
+            client.executable.to_str().unwrap(),
+        ])
+        .unwrap();
+        let manifest = local_manifest_path(directory.path(), &parse_remote_url(&args.url).unwrap());
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        let saved_manifest =
+            br#"{"version":1,"updater":{"path":"launcher","hash":[],"size":0},"files":[]}"#;
+        std::fs::write(&manifest, saved_manifest).unwrap();
+        let game_file = directory.path().join("config.xml");
+        std::fs::write(&game_file, b"installed game data").unwrap();
+
+        // Exercise normal updates, forced updates (including self-update),
+        // and --verify through the entry point shared by GUI/headless startup.
+        for (verify, force) in [(false, false), (false, true), (true, false)] {
+            args.verify = verify;
+            args.force_recheck = force;
+            args.force_recheck_updater = force;
+            let progress = ProgressState::default();
+            let error = run_file_process(&args, progress.clone()).await.unwrap_err();
+            assert!(error.to_string().contains("[ROSE-405]"), "{error:#}");
+            assert_ne!(progress.current_stage(), ProgressStage::Play);
+            assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
+            assert_eq!(std::fs::read(&game_file).unwrap(), b"installed game data");
+        }
+
+        // The manual Repair callback has its own entry point.
+        let error = run_verify_process(
+            &args.url,
+            &args.manifest_name,
+            &args.output,
+            &args.exe,
+            ProgressState::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("[ROSE-405]"));
+        assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
+        assert_eq!(std::fs::read(&game_file).unwrap(), b"installed game data");
+
+        // A retry takes a fresh snapshot and is allowed after the client exits.
+        client.stop();
+        game_process::ensure_stopped(&args.exe).unwrap();
+    }
 
     #[tokio::test]
     async fn cancellation_before_files_finish_does_not_start_runtime() {

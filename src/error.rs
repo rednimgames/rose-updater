@@ -69,6 +69,10 @@ pub enum ErrorCode {
     RestartLauncher = 403,
     /// Game exe spawn failed
     LaunchGame = 404,
+    /// A game client is holding files needed by the updater
+    GameRunning = 405,
+    /// Could not enumerate running processes safely
+    CheckGameProcess = 406,
 
     // Initialization (5xx)
     /// Logging/tracing setup failed
@@ -111,6 +115,8 @@ impl ErrorCode {
             Self::FindLauncherLocation => "Could not determine the launcher location",
             Self::RestartLauncher => "Could not restart the launcher after updating",
             Self::LaunchGame => "Could not start the game",
+            Self::GameRunning => "ROSE Online is running. Close all game clients, then try the update or Repair again",
+            Self::CheckGameProcess => "Could not check whether ROSE Online is running. Close the game and restart the launcher",
 
             Self::InitLogging => "Failed to initialize logging",
         }
