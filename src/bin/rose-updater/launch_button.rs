@@ -101,16 +101,9 @@ impl LaunchButton {
                     true
                 }
                 Event::Released => {
-                    let prev = *state.borrow();
-                    match prev {
-                        LaunchButtonState::Update => {}
-                        LaunchButtonState::Updating => {
-                            *state.borrow_mut() = LaunchButtonState::Play;
-                        }
-                        LaunchButtonState::Play => {}
+                    if f.active() && matches!(*state.borrow(), LaunchButtonState::Play) {
+                        f.do_callback();
                     }
-                    f.do_callback();
-                    f.redraw();
                     true
                 }
                 _ => false,
