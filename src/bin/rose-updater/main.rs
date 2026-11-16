@@ -1072,6 +1072,20 @@ async fn get_remote_files(
         }
     }
 
+    // Restore Crashpad's execute permission after updates and repairs, even
+    // when its contents were already up to date.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let handler_path = output_dir.join("crashpad_handler");
+        if handler_path.exists() {
+            let perms = std::fs::Permissions::from_mode(0o755);
+            fs::set_permissions(&handler_path, perms)
+                .await
+                .context("Failed to set execute permission on crashpad_handler")?;
+        }
+    }
+
     Ok(files_repaired)
 }
 
