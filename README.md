@@ -50,11 +50,17 @@ including self-updates, forced rechecks, and `--verify`. It checks again before
 modifying game files after downloading metadata or scanning local files. Matching
 is case-insensitive and applies to clients in any installation directory.
 
-A running client stops the operation with `ROSE-405`; failure to inspect running
-processes stops it with `ROSE-406`. Headless mode emits an `error` event and exits
-with code 1, without emitting `done`. Close the game and restart the launcher,
-or retry Repair. Failed or cancelled repairs keep Play disabled until a subsequent
-repair and runtime check succeed.
+A running client stops the operation with `ROSE-405`. If the launcher cannot
+inspect running processes, an OK/Cancel dialog asks you to make sure the client
+is stopped. OK continues the current update or Repair without asking again if
+later process checks fail; Cancel stops the operation. This confirmation is not
+saved for later operations, and a client detected by a subsequent check still
+blocks the update.
+
+Headless mode cannot show the confirmation dialog: a failed process check emits
+`ROSE-406` and exits with code 1, without emitting `done`. Use the graphical
+launcher to confirm the game is stopped and continue. Failed or cancelled repairs
+keep Play disabled until a subsequent repair and runtime check succeed.
 
 ### DNS fallback
 

@@ -116,7 +116,7 @@ impl ErrorCode {
             Self::RestartLauncher => "Could not restart the launcher after updating",
             Self::LaunchGame => "Could not start the game",
             Self::GameRunning => "ROSE Online is running. Close all game clients, then try the update or Repair again",
-            Self::CheckGameProcess => "Could not check whether ROSE Online is running. Close the game and restart the launcher",
+            Self::CheckGameProcess => "Could not check whether ROSE Online is running. Use the graphical launcher to confirm the game is stopped",
 
             Self::InitLogging => "Failed to initialize logging",
         }

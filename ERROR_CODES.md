@@ -269,11 +269,13 @@ The launcher stopped the update or Repair because a game client is running.
 
 ### ROSE-406 — Could not check whether ROSE Online is running
 
-The launcher could not inspect running processes, so it stopped before updating.
+The headless updater could not inspect running processes, so it stopped before
+updating. The graphical launcher instead offers an OK/Cancel confirmation.
 
 **What to try:**
-1. Close the game and restart the launcher
-2. If this continues, restart your computer and share the error details with support
+1. Close all ROSE Online clients
+2. Open the graphical launcher and press OK when asked to confirm the client is stopped
+3. Press Cancel if you are unsure; the update will stop and you can try again later
 
 ---
 

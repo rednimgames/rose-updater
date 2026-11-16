@@ -810,21 +810,36 @@ fn parse_remote_url(url: &str) -> anyhow::Result<Url> {
     Url::parse(&url_str).context(format!("{} ({})", ErrorCode::InvalidServerAddress, url))
 }
 
+fn game_process_check(
+    executable: &Path,
+    sender: Option<app::Sender<Message>>,
+) -> game_process::Check {
+    let check = game_process::Check::new(executable);
+    match sender {
+        Some(sender) => check.with_confirmation(move |reply| {
+            sender.send(Message::ProcessCheckFailed(reply));
+        }),
+        None => check,
+    }
+}
+
 async fn run_verify_process(
     verify_url: &str,
     manifest_name: &str,
     output_dir: &Path,
     executable: &Path,
     progress_state: ProgressState,
+    sender: Option<app::Sender<Message>>,
 ) -> anyhow::Result<FileProcessResult> {
-    game_process::ensure_stopped(executable)?;
+    let process_check = game_process_check(executable, sender);
+    process_check.ensure_stopped().await?;
     let remote_url = parse_remote_url(verify_url)?;
 
     verify_and_repair(
         &remote_url,
         manifest_name,
         output_dir,
-        executable,
+        &process_check,
         progress_state,
     )
     .await
@@ -870,7 +885,7 @@ async fn get_remote_files(
     base_url: &Url,
     files_to_update: &[FileToDownload],
     output_dir: &Path,
-    executable: &Path,
+    process_check: &game_process::Check,
     progress_state: ProgressState,
     pass: RemoteFilePass,
 ) -> anyhow::Result<usize> {
@@ -902,7 +917,7 @@ async fn get_remote_files(
         .collect();
 
     // Metadata requests may take time. Recheck before deleting any text files.
-    game_process::ensure_stopped(executable)?;
+    process_check.ensure_stopped().await?;
 
     // Bitar doesn't handle text files well so when one of the text files
     // has changed, we delete it first so bitar will just redownload the
@@ -961,7 +976,7 @@ async fn get_remote_files(
 
     // Scanning large installations can also take time. Refuse to open/reorder
     // files if a client was started since the initial check.
-    game_process::ensure_stopped(executable)?;
+    process_check.ensure_stopped().await?;
     let mut clone_outputs = {
         let clone_output_tasks = archive_readers
             .iter()
@@ -1078,7 +1093,7 @@ async fn verify_and_repair(
     remote_url: &Url,
     manifest_name: &str,
     output_dir: &Path,
-    executable: &Path,
+    process_check: &game_process::Check,
     progress_state: ProgressState,
 ) -> anyhow::Result<FileProcessResult> {
     progress_state.set_stage(ProgressStage::FetchingMetadata);
@@ -1094,7 +1109,7 @@ async fn verify_and_repair(
         remote_url,
         &all_files,
         output_dir,
-        executable,
+        process_check,
         progress_state,
         RemoteFilePass::verify(),
     )
@@ -1117,8 +1132,9 @@ async fn verify_and_repair(
 async fn update_process(
     args: &Args,
     progress_state: ProgressState,
+    process_check: &game_process::Check,
 ) -> anyhow::Result<UpdateProcessResult> {
-    game_process::ensure_stopped(&args.exe)?;
+    process_check.ensure_stopped().await?;
     progress_state.set_stage(ProgressStage::FetchingMetadata);
 
     fs::create_dir_all(&args.output)
@@ -1152,7 +1168,7 @@ async fn update_process(
     let local_manifest = if !args.skip_updater
         && (args.force_recheck_updater || updater_needs_update)
     {
-        game_process::ensure_stopped(&args.exe)?;
+        process_check.ensure_stopped().await?;
         let local_updater_path = args.output.join(&remote_manifest.updater.source_path);
 
         let remote = remote_url
@@ -1229,7 +1245,7 @@ async fn update_process(
         &remote_url,
         &files_to_update,
         &args.output,
-        &args.exe,
+        process_check,
         progress_state.clone(),
         RemoteFilePass::update(),
     )
@@ -1258,7 +1274,7 @@ async fn update_process(
             &remote_url,
             &files_to_update,
             &args.output,
-            &args.exe,
+            process_check,
             progress_state,
             RemoteFilePass::verify(),
         )
@@ -1285,6 +1301,7 @@ async fn update_process(
 async fn run_file_process(
     args: &Args,
     progress: ProgressState,
+    sender: Option<app::Sender<Message>>,
 ) -> anyhow::Result<UpdateProcessResult> {
     if args.verify {
         run_verify_process(
@@ -1293,11 +1310,13 @@ async fn run_file_process(
             &args.output,
             &args.exe,
             progress,
+            sender,
         )
         .await
         .map(UpdateProcessResult::ApplicationUpdated)
     } else {
-        update_process(args, progress).await
+        let process_check = game_process_check(&args.exe, sender);
+        update_process(args, progress, &process_check).await
     }
 }
 
@@ -1348,6 +1367,7 @@ async fn complete_gui_operation(
 enum Message {
     News(news::NewsMessage),
     Shutdown,
+    ProcessCheckFailed(tokio::sync::oneshot::Sender<bool>),
     Error {
         message: String,
         details: String,
@@ -1723,6 +1743,7 @@ async fn main() -> process::ExitCode {
                         &verify_output,
                         &verify_exe,
                         progress_state.clone(),
+                        Some(app_message_sender),
                     ),
                     async {
                         tokio::select! {
@@ -1743,6 +1764,9 @@ async fn main() -> process::ExitCode {
                 match result {
                     None => app_message_sender.send(Message::VerifyCancelled),
                     Some(Ok(())) => {}
+                    Some(Err(error)) if error.is::<game_process::Cancelled>() => {
+                        app_message_sender.send(Message::VerifyCancelled);
+                    }
                     Some(Err(error)) => {
                         error!("Verification failed: {error:#}");
                         app_message_sender.send(Message::VerifyFailed(format!(
@@ -1765,7 +1789,7 @@ async fn main() -> process::ExitCode {
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let result = run_cancellable_files(
-                run_file_process(&args, progress_state.clone()),
+                run_file_process(&args, progress_state.clone(), Some(app_message_sender)),
                 shutdown_rx.changed(),
                 |result| async {
                     match result {
@@ -1781,6 +1805,10 @@ async fn main() -> process::ExitCode {
             )
             .await;
             if let Some(Err(error)) = result {
+                if error.is::<game_process::Cancelled>() {
+                    app_message_sender.send(Message::Shutdown);
+                    return;
+                }
                 error!("Update failed: {error:#}");
                 app_message_sender.send(Message::Error {
                     message: error.to_string(),
@@ -1802,6 +1830,20 @@ async fn main() -> process::ExitCode {
                 Message::Shutdown => {
                     info!("Shutting down");
                     break 'event_loop;
+                }
+                Message::ProcessCheckFailed(reply) => {
+                    // Stop/shutdown may have cancelled the operation while this
+                    // message was queued. Never prompt for abandoned file work.
+                    if reply.is_closed() {
+                        continue;
+                    }
+                    let result = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("Game status unknown")
+                        .set_description("Couldn't find out if ROSE was running. Please make sure the client is stopped, then press OK to continue the update.")
+                        .set_buttons(rfd::MessageButtons::OkCancel)
+                        .show();
+                    let _ = reply.send(result == rfd::MessageDialogResult::Ok);
                 }
                 Message::Error { message, details } => {
                     rfd::MessageDialog::new()
@@ -2130,7 +2172,9 @@ mod runtime_flow_tests {
             args.force_recheck = force;
             args.force_recheck_updater = force;
             let progress = ProgressState::default();
-            let error = run_file_process(&args, progress.clone()).await.unwrap_err();
+            let error = run_file_process(&args, progress.clone(), None)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("[ROSE-405]"), "{error:#}");
             assert_ne!(progress.current_stage(), ProgressStage::Play);
             assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
@@ -2144,6 +2188,7 @@ mod runtime_flow_tests {
             &args.output,
             &args.exe,
             ProgressState::default(),
+            None,
         )
         .await
         .unwrap_err();
@@ -2153,7 +2198,10 @@ mod runtime_flow_tests {
 
         // A retry takes a fresh snapshot and is allowed after the client exits.
         client.stop();
-        game_process::ensure_stopped(&args.exe).unwrap();
+        game_process::Check::new(&args.exe)
+            .ensure_stopped()
+            .await
+            .unwrap();
 
         // A client can also start while the manifest is downloading. The
         // later guard must keep its actionable process error (not ROSE-100)
@@ -2177,7 +2225,7 @@ mod runtime_flow_tests {
             socket.write_all(response.as_bytes()).await.unwrap();
             client
         });
-        let error = run_file_process(&args, ProgressState::default())
+        let error = run_file_process(&args, ProgressState::default(), None)
             .await
             .unwrap_err();
         let _client = serving.await.unwrap();
@@ -2263,7 +2311,7 @@ mod runtime_flow_tests {
         .unwrap();
         for (verify, version) in [(false, "14.44"), (false, "14.50"), (true, "14.51.123")] {
             args.verify = verify;
-            let result = run_file_process(&args, ProgressState::default())
+            let result = run_file_process(&args, ProgressState::default(), None)
                 .await
                 .unwrap();
             let UpdateProcessResult::ApplicationUpdated(files) = result else {
