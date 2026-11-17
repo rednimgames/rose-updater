@@ -44,11 +44,14 @@ For more information check use the `--help` commands the executables
 
 ### Updating while the game is running
 
-Close all ROSE Online clients before starting an update or Repair. The launcher
-checks for `trose`, `trose.exe`, and the configured `--exe` name before file work,
-including self-updates, forced rechecks, and `--verify`. It checks again before
-modifying game files after downloading metadata or scanning local files. Matching
-is case-insensitive and applies to clients in any installation directory.
+An up-to-date installation can launch additional clients while ROSE Online is
+running. Repair, `--verify`, and forced rechecks scan files without modifying
+them and skip files that already match the server.
+
+Close all clients when files actually need updating or repairing. The launcher
+checks for `trose`, `trose.exe`, and the configured `--exe` name immediately before
+changing game files, or before a self-update. Matching is case-insensitive and
+applies to clients in any installation directory.
 
 A running client stops the operation with `ROSE-405`. If the launcher cannot
 inspect running processes, an OK/Cancel dialog asks you to make sure the client

@@ -44,6 +44,8 @@ pub mod headless;
 pub mod launch_button;
 mod news;
 pub mod progress_bar;
+#[cfg(test)]
+mod update_tests;
 pub mod vc_runtime;
 
 const LOCAL_MANIFEST_VERSION: usize = 1;
@@ -832,7 +834,6 @@ async fn run_verify_process(
     sender: Option<app::Sender<Message>>,
 ) -> anyhow::Result<FileProcessResult> {
     let process_check = game_process_check(executable, sender);
-    process_check.ensure_stopped().await?;
     let remote_url = parse_remote_url(verify_url)?;
 
     verify_and_repair(
@@ -891,7 +892,7 @@ async fn get_remote_files(
 ) -> anyhow::Result<usize> {
     info!(count = files_to_update.len(), "Starting clone process");
 
-    let mut archive_readers = {
+    let archive_readers = {
         let mut archive_reader_tasks = Vec::new();
         for file_data in files_to_update {
             let file_url = base_url
@@ -915,26 +916,6 @@ async fn get_remote_files(
         .iter()
         .map(|file_data| output_dir.join(&file_data.local_path))
         .collect();
-
-    // Metadata requests may take time. Recheck before deleting any text files.
-    process_check.ensure_stopped().await?;
-
-    // Bitar doesn't handle text files well so when one of the text files
-    // has changed, we delete it first so bitar will just redownload the
-    // whole file.
-    for path in &local_file_paths {
-        if !path.exists() || !should_remove_text_file(pass, path) {
-            continue;
-        }
-
-        if let Err(e) = std::fs::remove_file(&path) {
-            error!(
-                path =? path.display(),
-                error =? e,
-                "Failed to delete text file"
-            )
-        }
-    }
 
     let mut total_local_chunk_count = 0;
     for (archive_reader, local_file_path) in archive_readers.iter().zip(&local_file_paths) {
@@ -969,14 +950,54 @@ async fn get_remote_files(
         chunk_indexes?
     };
 
+    // Scanning is read-only. Only keep files whose contents/layout/size need
+    // changing, so a current installation can be verified while a client runs.
+    let mut pending_readers = Vec::new();
+    let mut pending_paths = Vec::new();
+    let mut pending_indexes = Vec::new();
+    for ((reader, path), index) in archive_readers
+        .into_iter()
+        .zip(local_file_paths)
+        .zip(chunk_indexes)
+    {
+        if local_file_matches_archive(&reader, &path, &index).await? {
+            continue;
+        }
+        pending_readers.push(reader);
+        pending_paths.push(path);
+        pending_indexes.push(index);
+    }
+    let mut archive_readers = pending_readers;
+    let local_file_paths = pending_paths;
+    let mut chunk_indexes = pending_indexes;
+
+    if !archive_readers.is_empty() {
+        // This is the first destructive step. Check after metadata downloads
+        // and local scans, immediately before deletion/reordering/creation.
+        process_check.ensure_stopped().await?;
+    }
+
+    // Preserve the text-file workaround, but only for files needing changes.
+    // Their old chunk indexes cannot be reused after deleting the local files.
+    for ((path, index), reader) in local_file_paths
+        .iter()
+        .zip(&mut chunk_indexes)
+        .zip(&archive_readers)
+    {
+        if !path.exists() || !should_remove_text_file(pass, path) {
+            continue;
+        }
+        fs::remove_file(path)
+            .await
+            .with_context(|| format!("{} ({})", ErrorCode::OpenFileForWriting, path.display()))?;
+        *index = ChunkIndex::new_empty(reader.chunk_hash_length());
+    }
+
     info!(
         clone_output_count = archive_readers.len(),
         "Initializing clone outputs"
     );
 
-    // Scanning large installations can also take time. Refuse to open/reorder
-    // files if a client was started since the initial check.
-    process_check.ensure_stopped().await?;
     let mut clone_outputs = {
         let clone_output_tasks = archive_readers
             .iter()
@@ -1089,6 +1110,32 @@ async fn get_remote_files(
     Ok(files_repaired)
 }
 
+/// Existing chunks must have the same sizes and offsets, not merely the same
+/// hashes: reordering chunks or trimming a stale tail still modifies the file.
+async fn local_file_matches_archive(
+    reader: &RemoteArchiveReader,
+    path: &Path,
+    local_index: &ChunkIndex,
+) -> anyhow::Result<bool> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("{} ({})", ErrorCode::ReadFileMetadata, path.display()))
+        }
+    };
+    if metadata.len() != reader.total_source_size() {
+        return Ok(false);
+    }
+    let source_index = reader.build_source_index();
+    let local_chunks: HashMap<_, _> = local_index.iter_chunks().collect();
+    Ok(local_chunks.len() == source_index.len()
+        && source_index
+            .iter_chunks()
+            .all(|(hash, location)| local_chunks.get(hash).copied() == Some(location)))
+}
+
 /// Build the full file list from a remote manifest (all files, not just changed ones)
 fn build_full_file_list(remote_manifest: &RemoteManifest) -> Vec<FileToDownload> {
     remote_manifest
@@ -1148,7 +1195,6 @@ async fn update_process(
     progress_state: ProgressState,
     process_check: &game_process::Check,
 ) -> anyhow::Result<UpdateProcessResult> {
-    process_check.ensure_stopped().await?;
     progress_state.set_stage(ProgressStage::FetchingMetadata);
 
     fs::create_dir_all(&args.output)
@@ -2154,99 +2200,6 @@ mod tests {
 #[cfg(test)]
 mod runtime_flow_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn running_game_blocks_update_and_repair_without_changing_files_or_manifest() {
-        let mut client = game_process::tests::Client::start();
-        let directory = tempfile::tempdir().unwrap();
-        let mut args = Args::try_parse_from([
-            "updater",
-            "--headless",
-            "--skip-updater=false",
-            "--url",
-            "http://127.0.0.1:1/",
-            "--output",
-            directory.path().to_str().unwrap(),
-            "--exe",
-            client.executable.to_str().unwrap(),
-        ])
-        .unwrap();
-        let manifest = local_manifest_path(directory.path(), &parse_remote_url(&args.url).unwrap());
-        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        let saved_manifest =
-            br#"{"version":1,"updater":{"path":"launcher","hash":[],"size":0},"files":[]}"#;
-        std::fs::write(&manifest, saved_manifest).unwrap();
-        let game_file = directory.path().join("config.xml");
-        std::fs::write(&game_file, b"installed game data").unwrap();
-
-        // Exercise normal updates, forced updates (including self-update),
-        // and --verify through the entry point shared by GUI/headless startup.
-        for (verify, force) in [(false, false), (false, true), (true, false)] {
-            args.verify = verify;
-            args.force_recheck = force;
-            args.force_recheck_updater = force;
-            let progress = ProgressState::default();
-            let error = run_file_process(&args, progress.clone(), None)
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("[ROSE-405]"), "{error:#}");
-            assert_ne!(progress.current_stage(), ProgressStage::Play);
-            assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
-            assert_eq!(std::fs::read(&game_file).unwrap(), b"installed game data");
-        }
-
-        // The manual Repair callback has its own entry point.
-        let error = run_verify_process(
-            &args.url,
-            &args.manifest_name,
-            &args.output,
-            &args.exe,
-            ProgressState::default(),
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("[ROSE-405]"));
-        assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
-        assert_eq!(std::fs::read(&game_file).unwrap(), b"installed game data");
-
-        // A retry takes a fresh snapshot and is allowed after the client exits.
-        client.stop();
-        game_process::Check::new(&args.exe)
-            .ensure_stopped()
-            .await
-            .unwrap();
-
-        // A client can also start while the manifest is downloading. The
-        // later guard must keep its actionable process error (not ROSE-100)
-        // and leave the saved manifest and files untouched.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        args.url = format!("http://{}/", server.local_addr().unwrap());
-        args.verify = false;
-        args.skip_updater = true;
-        let serving = tokio::spawn(async move {
-            let (mut socket, _) = server.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
-            let client = game_process::tests::Client::start();
-            let body = serde_json::to_string(&RemoteManifest::default()).unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            client
-        });
-        let error = run_file_process(&args, ProgressState::default(), None)
-            .await
-            .unwrap_err();
-        let _client = serving.await.unwrap();
-        assert!(error.to_string().contains("[ROSE-405]"), "{error:#}");
-        assert_eq!(std::fs::read(&manifest).unwrap(), saved_manifest);
-        assert_eq!(std::fs::read(&game_file).unwrap(), b"installed game data");
-    }
 
     #[tokio::test]
     async fn cancellation_before_files_finish_does_not_start_runtime() {

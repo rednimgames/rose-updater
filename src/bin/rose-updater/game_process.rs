@@ -345,11 +345,13 @@ pub(crate) mod tests {
         pub fn start() -> Self {
             use std::io::BufRead;
             let directory = tempfile::tempdir().unwrap();
-            let executable = directory.path().join(if cfg!(windows) {
-                "rose-guard.exe"
-            } else {
-                "rose-guard"
-            });
+            // Each test owns a distinct process name, so another concurrent
+            // fixture cannot look like a client that this test already closed.
+            let executable = directory.path().join(format!(
+                "rg-{}{}",
+                directory.path().file_name().unwrap().to_string_lossy(),
+                if cfg!(windows) { ".exe" } else { "" }
+            ));
             std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
             let mut child = std::process::Command::new(&executable)
                 .args([
