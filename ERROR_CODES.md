@@ -260,7 +260,9 @@ The launcher tried to start the game but could not find or run the game executab
 
 ### ROSE-405 — ROSE Online is running
 
-The launcher stopped the update or Repair because a game client is running.
+The launcher found files that need changing, but stopped the update or Repair
+because a game client is running. An up-to-date installation can launch
+additional clients without this check.
 
 **What to try:**
 1. Close all ROSE Online clients, including clients from other installation folders
